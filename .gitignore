@@ -29,5 +29,20 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+outputs/
+data/
+dataset/
 .env
 *.part
+
+# Downloaded Model Weights & Artifacts (verified via configs/poc_models.json & scripts/download_models.py)
+*.pt
+*.h5
+*.keras
+*.pkl
+*.npz
+*.onnx
+*.joblib
+*_openvino_model/
+models/relateanything/
+models/fall-risk/

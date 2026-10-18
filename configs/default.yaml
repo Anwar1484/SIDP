@@ -1,0 +1,108 @@
+# SIDP unified configuration: Subsystem 1 (acquisition) + Subsystem 2 (vision posture detection).
+# Camera credentials can be overridden without editing this file:
+#   SIDP_CAMERA_HOST, SIDP_CAMERA_USER, SIDP_CAMERA_PASSWORD, SIDP_CAMERA_STREAM
+
+# ---------------- Subsystem 1: Camera & video acquisition ----------------
+camera:
+  source: rtsp            # rtsp = Tapo C210 over Wi-Fi, webcam = local USB/laptop camera
+  host: 172.20.10.4
+  username: SIDPProject
+  password: SIDPUTP2026
+  rtsp_port: 554
+  stream: stream2         # stream2 = low-latency sub-stream (stream1 = full-resolution main stream)
+  rtsp_transport: null    # null = FFmpeg default; set tcp if the Wi-Fi link drops packets
+  reconnect_seconds: 2.0
+  frame_timeout_seconds: 10.0
+  index: 0                # webcam index (used only when source: webcam)
+  width: 640
+  height: 480
+  id: tapo_c210
+ptz:
+  enabled: true
+  port: 2020
+  pan_speed: 0.4
+  tilt_speed: 0.3
+  step_seconds: 0.4
+  patrol_sweep_seconds: 1.0   # ~35 degrees of travel at pan_speed 0.4
+  patrol_dwell_seconds: 0.4
+  settle_seconds: 0.6         # motion features are ignored while/just after the camera moves
+dataset:
+  directory: dataset
+  classes: [standing, sitting, bending, falling_lying]
+  record_hz: 2.0
+  jpeg_quality: 95
+
+# ---------------- Subsystem 2: Vision posture detection ----------------
+pose:
+  # YOLO26m-pose: best keypoint accuracy that still runs well above camera rate on an
+  # RTX 4050 Laptop GPU (6 GB) in FP16. Use models/yolo26n-pose.pt for CPU-only machines.
+  model: models/yolo26m-pose.pt
+  device: auto            # auto = NVIDIA GPU when available, else CPU
+  confidence: 0.25
+  keypoint_confidence: 0.3
+  image_size: 640
+  cpu_threads: 4
+  half: true              # FP16 on GPU (ignored on CPU)
+tracker:
+  backend: bytetrack
+  stale_seconds: 1.0
+  min_iou: 0.05
+  max_centroid_distance: 0.18
+  iou_weight: 0.65
+activity:
+  walking_min_velocity: 0.12    # body-centroid speed in frame-widths per second
+  inactivity_seconds: 20.0
+  fall_transition_seconds: 2.0  # upright -> lying faster than this is classified as a fall
+  recovery_seconds: 1.0
+temporal:
+  capacity: 120
+  posture_window: 30
+  fall_window: 60
+  sample_hz: 30.0
+  max_gap_seconds: 0.5
+  min_coverage: 0.5
+  min_valid_ratio: 0.7
+  inference_interval_seconds: 0.15
+  stationary_velocity: 0.04
+  model_manifest: null
+state:
+  downward_velocity: 0.35
+  rotation_velocity: 80.0
+  height_reduction_velocity: -0.4
+  aspect_ratio_velocity: 0.8
+  horizontal_angle: 65.0
+  horizontal_ratio: 1.15
+  possible_probability: 0.45
+  falling_probability: 0.65
+  possible_persistence_seconds: 0.12
+  falling_persistence_seconds: 0.12
+  lying_persistence_seconds: 1.0
+  recovery_seconds: 0.8
+  episode_timeout_seconds: 3.0
+  score_weights:
+    downward: 0.5
+    rotation: 0.2
+    shrinking: 0.15
+    widening: 0.1
+    horizontal: 0.05
+api:
+  camera_enabled: true
+  websocket_hz: 20.0
+  max_image_bytes: 10000000
+  max_image_pixels: 16000000
+secondary:                # auxiliary RGB fall detector (evidence only, never overrides posture)
+  enabled: true
+  model: models/human-fall-detection.pt
+  image_size: 416
+  confidence_floor: 0.25
+  interval_seconds: 0.4
+  max_age_seconds: 0.65
+  min_iou: 0.2
+evidence:
+  model: null
+risk:                     # pretrained Tree + ST-GCN/TCN pre-fall / fall temporal model
+  enabled: true
+scene:                    # RelateAnything person-object relations (context labels)
+  enabled: true
+  interval_seconds: 1.0
+  max_age_seconds: 2.5
