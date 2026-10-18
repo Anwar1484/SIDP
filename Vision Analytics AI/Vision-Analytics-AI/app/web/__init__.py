@@ -1,0 +1,1 @@
+"""Local monitor assets."""

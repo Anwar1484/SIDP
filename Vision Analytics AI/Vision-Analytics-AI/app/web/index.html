@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SIDP · Vision Monitor</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23151515'/%3E%3Cpath d='M8 10v12M16 6v20M24 10v12' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/monitor.css">
+  <script src="/assets/monitor.js?v=20261016" defer></script>
+</head>
+<body>
+  <svg class="icon-definitions" aria-hidden="true"><defs>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M8 5l1.5-2h5L16 5h4v15H4V5z"/><circle cx="12" cy="12" r="4"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M9 4H4v5m11-5h5v5M4 15v5h5m6 0h5v-5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 11a8 8 0 1 1 2 7M4 4v7h7"/></symbol>
+    <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="6" r="3"/><path d="M5 21v-3a7 7 0 0 1 14 0v3"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M2 12h5l3-7 4 14 3-7h5"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6zM8 12l3 3 5-6"/></symbol>
+  </defs></svg>
+
+  <div class="shell">
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="SIDP Vision Monitor"><span class="brand-mark"><i></i><i></i><i></i></span><span>SIDP<span class="brand-divider">/</span><span class="brand-sub">VISION MONITOR</span></span></a>
+      <div class="masthead-right"><span class="local-tag"><span class="small-dot"></span>LOCAL SESSION</span><span class="clock" id="clock">--:--:--</span></div>
+    </header>
+
+    <main>
+      <div class="page-heading">
+        <div><div class="eyebrow">REAL-TIME OBSERVATION</div><h1>Live monitoring</h1><p>Person tracking, scene understanding, and temporal fall evidence.</p></div>
+        <div class="session-state" id="sessionState"><span class="status-dot"></span><span id="sessionLabel">Connecting</span></div>
+      </div>
+
+      <div id="notice" class="notice glass" role="status" hidden></div>
+
+      <div class="workspace">
+        <section class="preview glass" aria-label="Live camera preview">
+          <div class="panel-heading preview-heading">
+            <div class="camera-title"><svg class="icon"><use href="#i-camera"/></svg><div><h2 id="cameraTitle">Camera 0</h2><span id="sourceDetail">Live camera · awaiting connection</span></div></div>
+            <div class="preview-actions"><span class="resolution" id="resolution">LIVE VIEW</span><button id="fullscreen" class="icon-button" aria-label="Fullscreen preview" title="Fullscreen preview"><svg class="icon"><use href="#i-expand"/></svg></button></div>
+          </div>
+          <div class="stage" id="stage">
+            <canvas id="feed" width="640" height="480" aria-label="Camera image with person tracking and pose overlays"></canvas>
+            <div class="stage-empty" id="stageEmpty"><div class="empty-camera"><svg class="icon"><use href="#i-camera"/></svg></div><h3 id="emptyTitle">Your monitoring space.</h3><p id="emptyMessage">Start the camera to see people and their movement.</p><span class="empty-caption">For temporal evidence, keep the full body in view.</span></div>
+            <div class="feed-badge" id="feedBadge" hidden><span class="small-dot"></span>LIVE <span class="feed-separator">/</span><span id="feedPeople">0 people</span></div>
+            <div class="frame-guidance" id="frameGuidance" hidden></div>
+          </div>
+          <div class="camera-controls">
+            <div class="source-controls"><label class="select-wrap"><span class="sr-only">Camera source</span><select id="cameraIndex"><option value="0">Camera 0</option><option value="1">Camera 1</option><option value="2">Camera 2</option></select></label><label class="select-wrap"><span class="sr-only">Inference quality</span><select id="quality"><option value="512">Balanced</option><option value="416">Faster</option><option value="640">More detail</option></select></label></div>
+            <button class="primary-button" id="cameraButton" disabled><svg class="icon"><use href="#i-play"/></svg><span>Start monitoring</span></button>
+          </div>
+        </section>
+
+        <aside class="sidebar">
+          <section class="performance glass">
+            <div class="panel-heading"><div><div class="eyebrow">LIVE DIAGNOSTICS</div><h2>Performance</h2></div><svg class="icon muted"><use href="#i-wave"/></svg></div>
+            <div class="metrics"><div><span>Inference FPS</span><strong id="fps">—</strong></div><div><span>People in view</span><strong id="people">0</strong></div><div><span>Processing</span><strong><b id="latency">—</b><small>ms</small></strong></div><div><span>Frame age</span><strong><b id="frameAge">—</b><small>ms</small></strong></div></div>
+            <div class="compute-row"><span class="metric-label">COMPUTE</span><span id="device">Connecting</span></div>
+            <svg id="performanceChart" class="sparkline" viewBox="0 0 280 35" preserveAspectRatio="none" aria-label="Recent inference rate"><path d="M0 34H280" class="sparkline-base"/><polyline id="sparkline" points=""/></svg>
+          </section>
+
+          <section class="people-panel glass">
+            <div class="panel-heading"><div><div class="eyebrow">INDEPENDENT TRACKS</div><h2>People</h2></div><span class="count-badge" id="trackCount">0</span></div>
+            <div id="personCards" class="person-cards"><div class="people-empty"><svg class="icon"><use href="#i-person"/></svg><p>No people in view</p><span>Tracks appear here as people enter the frame.</span></div></div>
+          </section>
+        </aside>
+      </div>
+
+      <div class="lower-grid">
+        <section class="presentation glass"><div class="panel-heading"><div><div class="eyebrow">PRESENTATION</div><h2>Display overlays</h2></div><span class="quiet-label">Changes apply live</span></div><div class="toggles">
+          <label class="toggle"><input type="checkbox" id="boxes" checked><span class="switch"></span>Bounding boxes</label>
+          <label class="toggle"><input type="checkbox" id="skeleton" checked><span class="switch"></span>Pose skeleton</label>
+          <label class="toggle"><input type="checkbox" id="labels" checked><span class="switch"></span>Activity labels</label>
+          <label class="toggle"><input type="checkbox" id="confidence" checked><span class="switch"></span>Confidence</label>
+          <label class="toggle"><input type="checkbox" id="trackIds" checked><span class="switch"></span>Track IDs</label>
+        </div></section>
+        <section class="baseline glass"><svg class="icon"><use href="#i-shield"/></svg><div><h2>Standing baseline</h2><p>Stand briefly with shoulders and hips visible, then move naturally.</p></div><button class="icon-button" id="resetBaseline" title="Reset standing baseline" aria-label="Reset standing baseline" disabled><svg class="icon"><use href="#i-reset"/></svg></button></section>
+      </div>
+
+      <details class="model-details glass"><summary><span>Model pipeline</span><span class="pipeline-summary" id="pipelineSummary">Loading model status</span><span class="summary-chevron">+</span></summary><div class="model-grid" id="modelGrid"></div><p class="model-note">Pre-fall is a learned pattern advisory. Confidence describes model output, not measured accuracy on this camera or a guaranteed future fall. Scene labels update independently to keep the live view responsive.</p></details>
+    </main>
+    <footer><span>SIDP <span class="footer-divider">/</span> VISION ANALYTICS</span><span>Local processing · camera frames stay on this computer</span></footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# Virtual Environments
+.venv/
+*/.venv/
+**/.venv/
+.venv-backup-*/
+env/
+venv/
+
+# Compressed Archives
+*.zip
+Vision Analytics AI.zip
+
+# Python Bytecode & Cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Temporary & IDE Cache Directories
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/
+.idea/
+.vscode/
+.runtime/
+**/.runtime/
+*.egg-info/
+build/
+dist/
+.env
+*.part

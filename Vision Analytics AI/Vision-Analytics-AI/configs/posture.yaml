@@ -1,0 +1,10 @@
+min_coverage: 0.4
+standing_max_torso_angle: 30.0
+standing_min_knee_angle: 155.0
+sitting_max_torso_angle: 45.0
+sitting_max_knee_angle: 135.0
+sitting_max_hip_angle: 140.0
+lying_min_torso_angle: 65.0
+lying_min_aspect_ratio: 1.15
+smoothing_seconds: 0.25
+history_seconds: 1.0

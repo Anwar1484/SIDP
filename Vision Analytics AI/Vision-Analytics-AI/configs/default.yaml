@@ -1,0 +1,70 @@
+camera:
+  index: 0
+  width: 640
+  height: 480
+  id: webcam_0
+pose:
+  model: yolo26n-pose.pt
+  device: auto
+  confidence: 0.1
+  keypoint_confidence: 0.3
+  image_size: 512
+  cpu_threads: 4
+tracker:
+  backend: bytetrack
+  stale_seconds: 1.0
+  min_iou: 0.05
+  max_centroid_distance: 0.18
+  iou_weight: 0.65
+temporal:
+  capacity: 120
+  posture_window: 30
+  fall_window: 60
+  sample_hz: 30.0
+  max_gap_seconds: 0.5
+  min_coverage: 0.5
+  min_valid_ratio: 0.7
+  inference_interval_seconds: 0.15
+  stationary_velocity: 0.04
+  model_manifest: null
+state:
+  downward_velocity: 0.35
+  rotation_velocity: 80.0
+  height_reduction_velocity: -0.4
+  aspect_ratio_velocity: 0.8
+  horizontal_angle: 65.0
+  horizontal_ratio: 1.15
+  possible_probability: 0.45
+  falling_probability: 0.65
+  possible_persistence_seconds: 0.12
+  falling_persistence_seconds: 0.12
+  lying_persistence_seconds: 1.0
+  recovery_seconds: 0.8
+  episode_timeout_seconds: 3.0
+  score_weights:
+    downward: 0.5
+    rotation: 0.2
+    shrinking: 0.15
+    widening: 0.1
+    horizontal: 0.05
+api:
+  camera_enabled: false
+  websocket_hz: 20.0
+  max_image_bytes: 10000000
+  max_image_pixels: 16000000
+secondary:
+  enabled: true
+  model: models/human-fall-detection.pt
+  image_size: 416
+  confidence_floor: 0.25
+  interval_seconds: 0.4
+  max_age_seconds: 0.65
+  min_iou: 0.2
+evidence:
+  model: null
+risk:
+  enabled: true
+scene:
+  enabled: true
+  interval_seconds: 1.0
+  max_age_seconds: 2.5
