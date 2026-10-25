@@ -1219,6 +1219,7 @@ class VisionAnalyticsRunner:
         h, w = frame.shape[:2]
         self.posture_engine.prune_stale_tracks(timestamp)
 
+        fp16_opts = {"quantize": 16} if self.use_half else {}
         results = self.pose_model.track(
             source=frame,
             persist=True,
@@ -1226,8 +1227,8 @@ class VisionAnalyticsRunner:
             conf=self.conf_threshold,
             imgsz=self.imgsz,
             device=self.device,
-            half=self.use_half,
             verbose=False,
+            **fp16_opts,
         )
         if not results:
             return []
@@ -1586,3 +1587,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
