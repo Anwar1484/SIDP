@@ -156,6 +156,14 @@ class CameraMonitor:
                     frame_id, frame, timestamp = self.latest
                 with self.model_lock:
                     observation = self.pipeline.process(frame, timestamp, frame_id)
+                if self.ptz is not None:
+                    h_f, w_f = frame.shape[:2]
+                    self.ptz.update_auto_tracking(
+                        [p.bbox for p in observation.persons],
+                        w_f,
+                        h_f,
+                        timestamp,
+                    )
                 now = perf_counter()
                 if published_at is not None:
                     instantaneous = 1 / max(now-published_at, 1e-6)

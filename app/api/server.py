@@ -219,6 +219,14 @@ def create_app(config: AppConfig | None = None, pose_backend: PoseBackend | None
         ptz.toggle_patrol()
         return status()
 
+    @api.post("/api/ptz/mode")
+    def ptz_mode_endpoint():
+        ptz = api.state.monitor.ptz
+        if ptz is None:
+            raise HTTPException(409, "PTZ controller is not initialized")
+        ptz.cycle_mode()
+        return status()
+
     @api.post("/api/dataset/class")
     def dataset_class_endpoint(cmd: DatasetClassSelect):
         api.state.monitor.collector.select_class(cmd.class_name)

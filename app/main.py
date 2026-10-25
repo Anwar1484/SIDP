@@ -122,16 +122,26 @@ def main(argv: list[str] | None = None):
                     output.write(observation.model_dump_json() + "\n")
                 frame_id += 1
                 if not args.headless:
+                    auto_state = None
+                    if ptz is not None:
+                        h_f, w_f = frame.shape[:2]
+                        auto_state = ptz.update_auto_tracking(
+                            [p.bbox for p in observation.persons],
+                            w_f,
+                            h_f,
+                            timestamp,
+                        )
                     rendered = draw_overlay(
                         frame,
                         observation,
                         ptz_mode=ptz.mode_label if ptz else None,
                         dataset_status=collector.status(),
                         ai_enabled=ai_enabled,
+                        auto_state=auto_state,
                     )
                     cv2.imshow(WINDOW_TITLE, rendered)
                     key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), ord("Q")):
+                    if key in (ord("q"), ord("Q"), 27):
                         break
                     elif key in (ord("p"), ord("P")):
                         ai_enabled = not ai_enabled
@@ -144,7 +154,9 @@ def main(argv: list[str] | None = None):
                         rec = collector.toggle_recording()
                         logger.info("dataset_auto_record enabled=%s", rec)
                     elif ptz is not None:
-                        if key in (ord("z"), ord("Z")):
+                        if key in (ord("m"), ord("M"), 9):
+                            ptz.cycle_mode()
+                        elif key in (ord("z"), ord("Z")):
                             ptz.toggle_patrol()
                         elif key in (ord("a"), ord("A"), 81):
                             ptz.pan_left()

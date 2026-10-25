@@ -84,3 +84,4 @@ class DatasetCollector:
             "counts": {name: self.count(name) for name in self.classes},
             "last_saved": last,
         }
+
