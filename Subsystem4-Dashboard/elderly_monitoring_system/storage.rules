@@ -1,0 +1,20 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /RESIDENT_PHOTOS/{residentId}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && (request.resource == null
+                       || (request.resource.size <= 5 * 1024 * 1024
+                           && request.resource.contentType.matches('image/(jpeg|png|webp)')));
+    }
+
+    match /POSTURE_ALERT_SNAPSHOTS/{residentId}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && (request.resource == null
+                       || (request.resource.size <= 1 * 1024 * 1024
+                           && request.resource.contentType == 'image/jpeg'));
+    }
+  }
+}

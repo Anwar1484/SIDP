@@ -45,6 +45,11 @@ dataset/
 *.onnx
 *.joblib
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+node_modules/
+**/node_modules/
 assets/audio/
 *_openvino_model/
 models/relateanything/

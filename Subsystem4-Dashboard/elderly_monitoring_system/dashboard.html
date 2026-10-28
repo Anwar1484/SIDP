@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="Elderly posture monitoring dashboard">
+    <title>Posture Monitoring Dashboard</title>
+    <link href="vendor/fontawesome-free/css/all.min.css" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css?family=Nunito:200,300,400,600,700,800,900"
+        rel="stylesheet">
+    <link href="css/sb-admin-2.min.css" rel="stylesheet">
+    <link href="css/posture-dashboard.css" rel="stylesheet">
+</head>
+
+<body id="page-top">
+    <div id="wrapper">
+        <ul class="navbar-nav bg-gradient-primary sidebar sidebar-dark accordion" id="accordionSidebar">
+            <a class="sidebar-brand d-flex align-items-center justify-content-center" href="#page-top">
+                <div class="sidebar-brand-icon"><i class="fas fa-heartbeat"></i></div>
+                <div class="sidebar-brand-text mx-2">Posture Monitor</div>
+            </a>
+            <hr class="sidebar-divider my-0">
+            <li class="nav-item active">
+                <a class="nav-link" href="#page-top"><i class="fas fa-fw fa-tachometer-alt"></i><span>Overview</span></a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="#residents"><i class="fas fa-fw fa-users"></i><span>Residents</span></a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="#activityLogs"><i class="fas fa-fw fa-clipboard-list"></i><span>Activity logs</span></a>
+            </li>
+            <hr class="sidebar-divider d-none d-md-block">
+            <div class="sidebar-status px-3 py-2">
+                <span class="status-dot" id="connectionDot"></span>
+                <span id="connectionText">Checking connection</span>
+            </div>
+        </ul>
+
+        <div id="content-wrapper" class="d-flex flex-column">
+            <div id="content">
+                <nav class="navbar navbar-expand navbar-light bg-white topbar mb-4 static-top shadow">
+                    <button id="sidebarToggleTop" class="btn btn-link d-md-none rounded-circle mr-3"
+                        type="button" aria-label="Toggle navigation">
+                        <i class="fa fa-bars"></i>
+                    </button>
+                    <span class="navbar-text font-weight-bold text-gray-800">Elderly Posture Monitoring</span>
+                    <ul class="navbar-nav ml-auto align-items-center">
+                        <li class="nav-item mr-2 d-none d-sm-inline-block text-gray-600 small" id="signedInUser"></li>
+                        <li class="nav-item">
+                            <button class="btn btn-outline-secondary btn-sm" id="signOutButton" type="button">
+                                <i class="fas fa-sign-out-alt fa-sm mr-1"></i>Sign out
+                            </button>
+                        </li>
+                    </ul>
+                </nav>
+
+                <main class="container-fluid">
+                    <div class="d-flex flex-wrap align-items-center justify-content-between mb-4">
+                        <div>
+                            <h1 class="h3 mb-1 text-gray-800">Monitoring overview</h1>
+                            <p class="mb-0 text-muted">Live posture status and resident activity</p>
+                        </div>
+                        <button class="btn btn-primary shadow-sm mt-3 mt-sm-0" type="button"
+                            id="addResidentButton" data-toggle="modal" data-target="#addResidentModal">
+                            <i class="fas fa-user-plus fa-sm mr-2"></i>Add resident
+                        </button>
+                    </div>
+
+                    <div class="alert alert-warning d-none" id="dashboardMessage" role="alert"></div>
+                    <div class="alert alert-info d-none" id="demoModeNotice" role="status">
+                        <i class="fas fa-flask mr-1"></i> Demo mode — this synthetic sample data is not connected to Firebase and will not be saved.
+                    </div>
+
+                    <div class="row">
+                        <div class="col-xl-3 col-md-6 mb-4">
+                            <div class="card border-left-primary shadow h-100 py-2">
+                                <div class="card-body dashboard-stat">
+                                    <div><div class="stat-label text-primary">Total residents</div>
+                                        <div class="stat-value" id="totalCount">0</div></div>
+                                    <i class="fas fa-users stat-icon text-gray-300"></i>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-xl-3 col-md-6 mb-4">
+                            <div class="card border-left-success shadow h-100 py-2">
+                                <div class="card-body dashboard-stat">
+                                    <div><div class="stat-label text-success">Safe posture</div>
+                                        <div class="stat-value" id="safeCount">0</div></div>
+                                    <i class="fas fa-user-check stat-icon text-gray-300"></i>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-xl-3 col-md-6 mb-4">
+                            <div class="card border-left-warning shadow h-100 py-2">
+                                <div class="card-body dashboard-stat">
+                                    <div><div class="stat-label text-warning">Unsafe posture</div>
+                                        <div class="stat-value" id="unsafeCount">0</div></div>
+                                    <i class="fas fa-user-exclamation stat-icon text-gray-300"></i>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-xl-3 col-md-6 mb-4">
+                            <div class="card border-left-danger shadow h-100 py-2">
+                                <div class="card-body dashboard-stat">
+                                    <div><div class="stat-label text-danger">Active alerts</div>
+                                        <div class="stat-value" id="alertCount">0</div></div>
+                                    <i class="fas fa-bell stat-icon text-gray-300"></i>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-xl-8 mb-4">
+                            <section class="card shadow h-100">
+                                <div class="card-header py-3 d-flex flex-wrap align-items-center justify-content-between">
+                                    <h2 class="h6 m-0 font-weight-bold text-primary">Live camera comparison</h2>
+                                    <div class="d-flex align-items-center mt-2 mt-sm-0">
+                                        <span class="badge badge-secondary mr-2" id="cameraStatus">Camera off</span>
+                                        <button class="btn btn-sm btn-primary" id="startCameraButton" type="button">
+                                            <i class="fas fa-video mr-1"></i>Start camera
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-secondary d-none" id="stopCameraButton" type="button">
+                                            Stop
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <div class="camera-comparison">
+                                        <div>
+                                            <div class="camera-panel-label"><i class="fas fa-eye mr-1"></i>Original · unmasked</div>
+                                            <div class="camera-frame">
+                                                <video id="cameraVideo" class="d-none" autoplay muted playsinline
+                                                    aria-label="Unmasked live resident camera feed"></video>
+                                                <img id="liveRawFeed" class="camera-stream-img d-none"
+                                                    alt="Unmasked live Tapo C210 camera feed from Subsystem 1">
+                                                <div class="camera-placeholder" id="cameraPlaceholder">
+                                                    <i class="fas fa-video-slash fa-3x mb-3"></i>
+                                                    <p class="mb-1 font-weight-bold">Camera feed is off</p>
+                                                    <p class="small mb-0">Start the camera to view the original feed.</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div class="camera-panel-label"><i class="fas fa-project-diagram mr-1"></i>Skeleton view</div>
+                                            <div class="camera-frame skeleton-frame" id="skeletonPlaceholder" role="img"
+                                                aria-label="Skeleton view live YOLO26-Pose and Subsystem 3 safety overlay">
+                                                <img id="liveSkeletonFeed" class="camera-stream-img d-none"
+                                                    alt="Live YOLO26-Pose skeleton and Subsystem 3 safety HUD feed">
+                                                <svg class="skeleton-illustration" id="skeletonIllustration" viewBox="0 0 160 220" aria-hidden="true">
+                                                    <circle cx="80" cy="27" r="15"></circle>
+                                                    <path d="M80 42v62m0-43L48 83 31 118m49-57 32 22 17 36M80 104l-25 48-8 47m33-95 25 48 8 47"></path>
+                                                    <circle cx="80" cy="42" r="4"></circle>
+                                                    <circle cx="80" cy="104" r="4"></circle>
+                                                    <circle cx="48" cy="83" r="4"></circle>
+                                                    <circle cx="31" cy="118" r="4"></circle>
+                                                    <circle cx="112" cy="83" r="4"></circle>
+                                                    <circle cx="129" cy="118" r="4"></circle>
+                                                    <circle cx="55" cy="152" r="4"></circle>
+                                                    <circle cx="47" cy="199" r="4"></circle>
+                                                    <circle cx="105" cy="152" r="4"></circle>
+                                                    <circle cx="113" cy="199" r="4"></circle>
+                                                </svg>
+                                                <div class="skeleton-placeholder-copy" id="skeletonPlaceholderCopy">
+                                                    <strong>Pose tracking not connected</strong>
+                                                    <span>Skeleton keypoints will appear here when the AI feed is connected.</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <p class="small text-muted mt-3 mb-0" id="cameraMessage">
+                                        The original feed is displayed without masking and stays in this browser. Snapshots are saved only when attached to a warning.
+                                    </p>
+                                </div>
+                            </section>
+                        </div>
+                        <div class="col-xl-4 mb-4">
+                            <section class="card shadow h-100">
+                                <div class="card-header py-3">
+                                    <div class="d-flex align-items-center">
+                                        <img class="resident-detail-photo mr-3" id="selectedResidentPhoto"
+                                            src="img/resident-placeholder.svg" alt="">
+                                        <div>
+                                            <h2 class="h6 mb-0 font-weight-bold text-primary">Selected resident</h2>
+                                            <span class="small text-muted" id="selectedResidentName">—</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <label for="selectedResident" class="small font-weight-bold text-gray-700">Resident</label>
+                                    <select class="form-control mb-4" id="selectedResident">
+                                        <option value="">No residents added</option>
+                                    </select>
+                                    <div class="d-flex justify-content-between align-items-center mb-3">
+                                        <span class="text-gray-600">Current posture</span>
+                                        <span class="badge badge-secondary" id="selectedPosture">No data</span>
+                                    </div>
+                                    <div class="d-flex justify-content-between mb-3">
+                                        <span class="text-gray-600">Detected activity</span>
+                                        <strong class="text-right" id="selectedActivity">—</strong>
+                                    </div>
+                                    <div class="d-flex justify-content-between mb-3">
+                                        <span class="text-gray-600">Fall detection</span>
+                                        <span class="badge badge-secondary" id="selectedFallStatus">No data</span>
+                                    </div>
+                                    <div class="d-flex justify-content-between mb-3">
+                                        <span class="text-gray-600">Inactivity detection</span>
+                                        <span class="badge badge-secondary" id="selectedInactivityStatus">No data</span>
+                                    </div>
+                                    <div class="d-flex justify-content-between mb-3">
+                                        <span class="text-gray-600">Posture angle</span>
+                                        <strong id="selectedAngle">—</strong>
+                                    </div>
+                                    <div class="d-flex justify-content-between mb-3">
+                                        <span class="text-gray-600">Age</span>
+                                        <strong id="selectedAge">—</strong>
+                                    </div>
+                                    <div class="mb-3">
+                                        <span class="d-block text-gray-600 mb-1">Address</span>
+                                        <span class="small" id="selectedAddress">—</span>
+                                    </div>
+                                    <div class="d-flex justify-content-between">
+                                        <span class="text-gray-600">Last update</span>
+                                        <span class="small text-right" id="selectedUpdated">—</span>
+                                    </div>
+                                    <hr>
+                                    <p class="small text-muted mb-0">Posture data updates when Subsystem 3 writes to <code>CURRENT_POSTURE_STATUS</code>.</p>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+
+                    <section class="card shadow mb-4" id="residents">
+                        <div class="card-header py-3 d-flex flex-wrap align-items-center justify-content-between">
+                            <h2 class="h6 m-0 font-weight-bold text-primary">Resident profiles</h2>
+                            <label class="sr-only" for="residentSearch">Search residents</label>
+                            <input class="form-control form-control-sm resident-search mt-2 mt-sm-0" type="search"
+                                id="residentSearch" placeholder="Search name or room">
+                        </div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-hover mb-0">
+                                    <thead><tr>
+                                        <th scope="col">Resident</th><th scope="col">Age</th><th scope="col">Address</th><th scope="col">Room</th>
+                                        <th scope="col">Baseline risk</th><th scope="col">Live posture</th>
+                                        <th scope="col">Angle</th><th scope="col">Action</th>
+                                    </tr></thead>
+                                    <tbody id="residentRows">
+                                        <tr><td colspan="8" class="text-center text-muted py-4">Loading residents…</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="card shadow mb-4" id="activityLogs">
+                        <div class="card-header py-3">
+                            <h2 class="h6 m-0 font-weight-bold text-primary">Posture status &amp; history</h2>
+                            <p class="small text-muted mb-0 mt-1">Warning and unsafe-posture events only. The dashboard loads up to the latest 100 records per resident.</p>
+                        </div>
+                        <div class="card-body">
+                            <form id="historyFilterForm" class="history-filters mb-4">
+                                <div class="form-group mb-2">
+                                    <label for="activityResidentFilter">Resident</label>
+                                    <select class="form-control" id="activityResidentFilter">
+                                        <option value="">Select a resident</option>
+                                    </select>
+                                </div>
+                                <div class="form-group mb-2">
+                                    <label for="historyFromDate">From date</label>
+                                    <input class="form-control" id="historyFromDate" type="date" required>
+                                </div>
+                                <div class="form-group mb-2">
+                                    <label for="historyToDate">To date</label>
+                                    <input class="form-control" id="historyToDate" type="date" required>
+                                </div>
+                                <div class="history-filter-actions">
+                                    <button class="btn btn-primary" type="submit">
+                                        <i class="fas fa-filter fa-sm mr-1"></i>Apply
+                                    </button>
+                                    <button class="btn btn-success" id="exportHistoryButton" type="button">
+                                        <i class="fas fa-file-excel fa-sm mr-1"></i>Export Excel
+                                    </button>
+                                </div>
+                            </form>
+                            <div class="alert alert-danger d-none" id="historyFilterError" role="alert"></div>
+                            <p class="small text-muted" id="historyRangeLabel"></p>
+
+                            <h3 class="h6 font-weight-bold text-gray-800 mb-3">Warning summary for selected period</h3>
+                            <div class="row" id="detectionSummary">
+                                <div class="col-xl-3 col-md-4 col-6 mb-3"><div class="summary-tile"><span>Warnings / unsafe</span><strong id="periodAlertCount">0</strong></div></div>
+                                <div class="col-xl-3 col-md-4 col-6 mb-3"><div class="summary-tile"><span>Falls</span><strong id="periodFallCount">0</strong></div></div>
+                                <div class="col-xl-3 col-md-4 col-6 mb-3"><div class="summary-tile"><span>Inactivity</span><strong id="periodInactivityCount">0</strong></div></div>
+                            </div>
+
+                            <h3 class="h6 font-weight-bold text-danger mb-3 mt-2">Warning &amp; unsafe history</h3>
+                            <div class="table-responsive">
+                                <table class="table table-hover mb-0">
+                                    <thead><tr>
+                                        <th scope="col">Time</th><th scope="col">Alert</th>
+                                        <th scope="col">Severity</th><th scope="col">Activity</th>
+                                        <th scope="col">Pose / posture</th><th scope="col">Notes</th><th scope="col">Snapshot</th>
+                                    </tr></thead>
+                                    <tbody id="alertRows">
+                                        <tr><td colspan="7" class="text-center text-muted py-4">Select a resident and date range to view warnings.</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                </main>
+            </div>
+            <footer class="sticky-footer bg-white">
+                <div class="container my-auto"><div class="copyright text-center my-auto">
+                    <span>Subsystem 4 · Elderly Posture Monitoring</span>
+                </div></div>
+            </footer>
+        </div>
+    </div>
+
+    <div class="modal fade" id="snapshotModal" tabindex="-1" role="dialog" aria-labelledby="snapshotModalTitle" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title h5 font-weight-bold text-primary" id="snapshotModalTitle">Warning snapshot</h2>
+                    <button class="close" type="button" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                </div>
+                <div class="modal-body text-center">
+                    <img class="warning-snapshot-image" id="snapshotImage" alt="Snapshot captured from the live camera during a warning">
+                    <p class="small text-muted mt-2 mb-0" id="snapshotTimestamp"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <a class="scroll-to-top rounded" href="#page-top" aria-label="Back to top">
+        <i class="fas fa-angle-up"></i>
+    </a>
+
+    <div class="modal fade" id="addResidentModal" tabindex="-1" role="dialog"
+        aria-labelledby="addResidentTitle" aria-hidden="true">
+        <div class="modal-dialog" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title h5 font-weight-bold text-primary" id="addResidentTitle">Add resident profile</h2>
+                    <button class="close" type="button" data-dismiss="modal" aria-label="Close">
+                        <span aria-hidden="true">&times;</span>
+                    </button>
+                </div>
+                <form id="residentForm">
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label for="resName">Full name</label>
+                            <input type="text" class="form-control" id="resName" maxlength="120" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="resPhoto">Profile photo <span class="font-weight-normal text-muted">(optional, JPG/PNG/WebP, max 5 MB)</span></label>
+                            <input type="file" class="form-control-file" id="resPhoto" accept="image/jpeg,image/png,image/webp">
+                            <div class="photo-preview-wrap mt-2 d-none" id="photoPreviewWrap">
+                                <img class="photo-preview" id="photoPreview" alt="Selected profile photo preview">
+                                <button class="btn btn-link btn-sm text-danger" id="clearPhotoButton" type="button">Remove photo</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="resAge">Age</label>
+                            <input type="number" class="form-control" id="resAge" min="60" max="120" step="1" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="resRoom">Room number</label>
+                            <input type="text" class="form-control" id="resRoom" maxlength="40" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="resAddress">Address</label>
+                            <textarea class="form-control" id="resAddress" maxlength="250" rows="2" required></textarea>
+                        </div>
+                        <div class="form-group mb-0">
+                            <label for="resRisk">Baseline risk category</label>
+                            <select class="form-control" id="resRisk" required>
+                                <option value="Low">Low</option>
+                                <option value="Moderate">Moderate</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div class="alert alert-danger d-none mt-3 mb-0" id="residentFormError" role="alert"></div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" type="button" data-dismiss="modal">Cancel</button>
+                        <button class="btn btn-primary" id="saveResidentButton" type="submit">Save profile</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script src="vendor/jquery/jquery.min.js"></script>
+    <script src="vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+    <script src="vendor/jquery-easing/jquery.easing.min.js"></script>
+    <script src="js/sb-admin-2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script type="module" src="js/posture-dashboard.js?v=20261028-icd03"></script>
+</body>
+</html>

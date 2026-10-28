@@ -1,0 +1,249 @@
+.dashboard-stat {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+}
+
+.stat-label {
+    font-size: .7rem;
+    font-weight: 700;
+    margin-bottom: .25rem;
+    text-transform: uppercase;
+}
+
+.stat-value {
+    color: #5a5c69;
+    font-size: 1.25rem;
+    font-weight: 700;
+}
+
+.stat-icon {
+    font-size: 2rem;
+}
+
+.sidebar-status {
+    color: rgba(255, 255, 255, .8);
+    font-size: .75rem;
+}
+
+.status-dot {
+    background: #f6c23e;
+    border-radius: 50%;
+    display: inline-block;
+    height: .55rem;
+    margin-right: .4rem;
+    width: .55rem;
+}
+
+.status-dot.is-connected {
+    background: #1cc88a;
+}
+
+.status-dot.is-error {
+    background: #e74a3b;
+}
+
+.camera-frame {
+    align-items: center;
+    background: #151923;
+    display: flex;
+    justify-content: center;
+    min-height: 230px;
+    position: relative;
+    width: 100%;
+}
+
+.camera-frame video,
+.camera-frame .camera-stream-img {
+    height: 100%;
+    max-height: 540px;
+    object-fit: contain;
+    width: 100%;
+}
+
+.skeleton-frame.is-streaming {
+    padding: 0;
+}
+
+.camera-comparison {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.camera-panel-label {
+    color: #5a5c69;
+    font-size: .75rem;
+    font-weight: 700;
+    margin-bottom: .5rem;
+    text-transform: uppercase;
+}
+
+.camera-comparison .camera-frame {
+    border-radius: .35rem;
+    overflow: hidden;
+}
+
+.camera-placeholder {
+    color: #d4d7de;
+    padding: 3rem 1.5rem;
+    text-align: center;
+}
+
+.camera-placeholder i {
+    color: #858b98;
+}
+
+.skeleton-frame {
+    align-items: center;
+    flex-direction: column;
+    gap: .25rem;
+    padding: 1rem;
+}
+
+.skeleton-illustration {
+    fill: #4e73df;
+    height: 150px;
+    max-width: 100%;
+    stroke: #9ab0ff;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 4px;
+}
+
+.skeleton-placeholder-copy {
+    color: #d4d7de;
+    display: flex;
+    flex-direction: column;
+    font-size: .75rem;
+    gap: .25rem;
+    text-align: center;
+}
+
+.skeleton-placeholder-copy strong {
+    color: #fff;
+}
+
+.warning-snapshot-image {
+    max-height: 70vh;
+    max-width: 100%;
+    object-fit: contain;
+}
+
+.resident-detail-photo,
+.resident-table-photo {
+    background: #f8f9fc;
+    border: 1px solid #eaecf4;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    object-fit: cover;
+}
+
+.resident-detail-photo {
+    height: 3rem;
+    width: 3rem;
+}
+
+.resident-table-photo {
+    height: 2.5rem;
+    width: 2.5rem;
+}
+
+.resident-name-cell {
+    align-items: center;
+    display: flex;
+    gap: .65rem;
+    min-width: 11rem;
+}
+
+.photo-preview-wrap {
+    align-items: center;
+    display: flex;
+    gap: .75rem;
+}
+
+.photo-preview {
+    border: 1px solid #eaecf4;
+    border-radius: 50%;
+    height: 4rem;
+    object-fit: cover;
+    width: 4rem;
+}
+
+.resident-search {
+    max-width: 260px;
+}
+
+.history-filters {
+    align-items: end;
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+}
+
+.history-filters label {
+    font-size: .8rem;
+    font-weight: 700;
+}
+
+.history-filter-actions {
+    display: flex;
+    gap: .5rem;
+    padding-bottom: .5rem;
+}
+
+.summary-tile {
+    align-items: center;
+    background: #f8f9fc;
+    border: 1px solid #eaecf4;
+    border-radius: .35rem;
+    color: #5a5c69;
+    display: flex;
+    font-size: .8rem;
+    justify-content: space-between;
+    min-height: 3.25rem;
+    padding: .7rem .85rem;
+}
+
+.summary-tile strong {
+    color: #4e73df;
+    font-size: 1.1rem;
+}
+
+@media (max-width: 575.98px) {
+    .camera-frame {
+        min-height: 190px;
+    }
+
+    .camera-comparison {
+        grid-template-columns: 1fr;
+    }
+
+    .resident-search {
+        max-width: none;
+        width: 100%;
+    }
+
+    .history-filters {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .history-filters .form-group:first-child {
+        grid-column: 1 / -1;
+    }
+
+    .history-filter-actions {
+        flex-wrap: wrap;
+        grid-column: 1 / -1;
+    }
+}
+
+@media (min-width: 576px) and (max-width: 991.98px) {
+    .history-filters {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .history-filter-actions {
+        padding-bottom: 0;
+    }
+}

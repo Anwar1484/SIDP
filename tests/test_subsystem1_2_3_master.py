@@ -95,3 +95,4 @@ def test_subsystem3_four_tier_state_machine_and_3s_bending_escalation(tmp_path):
             ptz.shutdown()
     finally:
         engine.shutdown()
+
