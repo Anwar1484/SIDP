@@ -1,0 +1,46 @@
+Step 1: Open PowerShell
+
+Click the Start menu (Windows icon), type PowerShell, and press Enter. A blue/black window opens -- that's a place where you type commands.
+
+Step 2: Go to the project folder
+
+Copy this line, paste it into the window (right-click to paste), press Enter:
+
+cd C:\Users\User\Desktop\Subsystem3\alert-engine
+
+Step 3: Start the system
+
+Paste this and press Enter:
+
+.venv\Scripts\python.exe -m alert_engine.main
+
+Some text will start scrolling -- that means it's running and waiting. Leave this window open, don't close it.
+
+Step 4: Watch it work
+
+Open a second PowerShell window (repeat Step 1), paste the same folder command from Step 2, then paste this and press Enter:
+
+.venv\Scripts\python.exe tools\monitor.py
+
+This window will show you live updates -- "SAFE", "WARNING", "UNSAFE", "ALERT" -- as things happen.
+
+Step 5: Make something happen (test it)
+
+Open a third PowerShell window, again paste the folder command from Step 2, then paste one of these and press Enter:
+
+.venv\Scripts\python.exe tools\simulate_publisher.py --scenario fall
+
+This pretends someone fell down. Watch window 2 -- you'll see it detect the fall and go to "ALERT", and you should hear a beep + a spoken warning through your speakers.
+
+Other things you can type instead of fall:
+- normal -- someone just walking around normally (nothing bad happens)
+- bending -- someone bending down for a while (watch it slowly escalate)
+- mixed -- everything at once, a full demo (takes about 50 seconds)
+
+Step 6: When you're done
+
+Just close all three windows, or click into each one and press Ctrl+C.
+
+---
+
+That's it -- three windows: one running the system, one watching it, one poking it to see what happens. You don't need to worry about anything else; the messaging service it depends on is already running quietly in the background and starts itself automatically.

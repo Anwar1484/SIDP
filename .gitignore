@@ -41,8 +41,11 @@ dataset/
 *.keras
 *.pkl
 *.npz
+!Subsystem3-Safety-Engine/models/risk_model.npz
 *.onnx
 *.joblib
+*.db
+assets/audio/
 *_openvino_model/
 models/relateanything/
 models/fall-risk/

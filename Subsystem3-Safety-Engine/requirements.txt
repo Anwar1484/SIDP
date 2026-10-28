@@ -1,0 +1,9 @@
+paho-mqtt>=2.1.0
+pydantic>=2.7.0
+numpy>=1.26.0
+PyYAML>=6.0.1
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pyttsx3>=2.90
+pytest>=8.0.0
+python-dotenv>=1.0.1

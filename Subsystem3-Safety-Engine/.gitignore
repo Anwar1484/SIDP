@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+assets/audio/*.wav
+logs/*.jsonl
+data/*.db
+.pytest_cache/
+*.egg-info/
+logs/scenario_runs/

@@ -241,3 +241,4 @@ def test_tri_mode_ptz_controller_and_osd(tmp_path):
         assert ptz.cycle_mode() == CameraMode.STATIC
     finally:
         ptz.shutdown()
+

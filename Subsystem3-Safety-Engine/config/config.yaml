@@ -1,0 +1,61 @@
+mqtt:
+  host: localhost
+  port: 1883
+  client_id: alert-engine
+
+postures: [sitting, standing, walking, bending, lying, fall, unknown]
+
+debounce:
+  window_s: 1.5
+  min_confirmations: 3
+  min_confidence: 0.6
+  resolve_after_s: 3.0
+  safe_postures: [sitting, standing, walking]   # which postures count as "safe" for the resolved state
+
+scoring:
+  posture_severity:
+    sitting: 5
+    standing: 5
+    walking: 10
+    bending: 40
+    lying: 55
+    fall: 95
+    unknown: 0
+  duration_weight: 30
+  duration_cap_s: 10
+  force_alert_postures: [fall]
+
+ml:                 # learned scorer; the rule-based scoring above stays as fallback
+  enabled: true     # false = rules only
+  model_path: models/risk_model.npz   # create with: python tools/train_model.py
+
+tiers:            # lower bound of each tier
+  safe: 0
+  warning: 30
+  unsafe: 60
+  alert: 80
+
+resident_profiles:
+  p-003: 1.2      # example: higher risk resident
+
+dispatch:
+  cooldown_s: 30
+  status_min_interval_s: 2
+
+watchdog:
+  camera_timeout_s: 5
+
+audio:
+  default_device: null   # null = OS default
+  messages:
+    unsafe: "Warning. Unsafe posture detected in the {zone}."
+    alert: "Alert. Possible fall detected in the {zone}. Please check immediately."
+
+notify:             # Telegram phone pop-ups; needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+  enabled: true     # without credentials this stays off automatically
+  tiers: [alert]            # emergency only; add unsafe to widen
+  postures: [fall, lying]   # only these postures send a message ([] = any)
+
+sink:
+  type: sqlite         # firebase later
+  sqlite_path: data/events.db
