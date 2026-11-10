@@ -100,6 +100,8 @@ objects:
 | `dispatcher.py` | Routes classified events by tier (section 8.4) |
 | `audio.py` | TTS-to-WAV, device selection, playback queue (section 8.5) |
 | `sinks.py` | `EventSink` interface + `LocalSqliteSink` (section 8.6) |
+| `activity.py` | Reads the per-person activity history and works out durations and totals |
+| `frames.py` | `FrameSource` interface + `FolderFrameSource`, supplies the photo for phone alerts |
 | `watchdog.py` | Camera dropout detection (section 8.7) |
 | `metrics.py` | Alert latency logging for R1 (section 8.8) |
 | `main.py` | Wires everything together |
@@ -148,17 +150,16 @@ JSON object keyed by `camera_id` (not per-camera subtopics), e.g.:
 | R4 | Every valid event classified into a tier | Met for confirmed postures; raw frames within the debounce window are intentionally not yet classified |
 | R5 | Malformed events rejected, 100%, no crash | Met — see `logs/rejected.jsonl` |
 | R6 | No alerts lost when internet drops | Deferred to the Firebase phase (out of scope now) |
-| R7 | No video/images leave the laptop | Met by construction — only structured posture events are handled |
+| R7 | No video/images leave the laptop | Met while `notify.attach_frame` is `false`. It is currently `true` in `config.yaml` for dummy-image testing only; R7 must be revised before real frames are sent |
 
 ## Known limitations / still to confirm
 
 - The final posture list, exact S2 event fields, Firebase DB structure, demo
   laptop OS, and final R1–R7 targets are still being confirmed with the team
   (CLAUDE.md section 16).
-- This dev environment didn't have Mosquitto installed; MQTT wiring is
-  implemented per section 7.1 and exercised by `simulate_publisher.py` +
-  `monitor.py`, but hasn't been run live end-to-end against a broker here.
-  `run_scenarios.py` verifies the pipeline logic without needing one.
+- MQTT has been tested live against a local Mosquitto broker using simulated
+  events. It has not yet been run with real S2 events.
+  `run_scenarios.py` verifies the pipeline logic without needing a broker.
 
 ## Learned risk scoring (supervisor feedback)
 
@@ -168,3 +169,10 @@ Decisions are driven by a trained model, with the original rules kept alongside.
 - Train: `python tools/train_model.py` (synthetic placeholder data) or `python tools/train_model.py --csv labelled.csv` (real labelled events from S2; columns `posture,duration_s,confidence,bend_angle_deg,resident_multiplier,tier`).
 - Switch off: set `ml.enabled: false` in `config/config.yaml`.
 - The shipped model is trained on synthetic data and must be retrained on real labelled data before any accuracy claim. Output message format (section 7.3) is unchanged.
+
+## Planned improvements
+
+- **Position prediction (not built):** warn staff before a resident becomes unsafe by estimating
+  their likely next posture. The simplest version would learn which postures usually follow each
+  other from `activity_log`, using real S2 data. How much is expected, and which subsystem owns it,
+  still need confirming with the supervisor.

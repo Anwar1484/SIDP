@@ -219,3 +219,37 @@ def test_icd03_http_server_endpoints(tmp_path: Path) -> None:
     finally:
         server.stop()
         bridge.shutdown()
+
+
+def test_master_1234_s2_s3_payload_interface() -> None:
+    from subsystem1_2_3_4_master import Subsystem3SafetyEngine
+
+    engine = Subsystem3SafetyEngine(
+        camera_id="tapo_c210_1234",
+        zone_name="bedroom",
+        audio_enabled=False,
+        telegram_enabled=False,
+    )
+    try:
+        kps = [[200.0, 150.0, 0.9] for _ in range(17)]
+        kps[5] = [200.0, 150.0, 0.95]
+        kps[6] = [200.0, 150.0, 0.95]
+        kps[11] = [200.0, 280.0, 0.95]
+        kps[12] = [200.0, 280.0, 0.95]
+
+        payload = {
+            "p-001": {
+                "bbox": [150.0, 100.0, 250.0, 420.0],
+                "keypoints": kps,
+                "posture": "standing",
+            }
+        }
+        res = engine.evaluate_payload(payload, now_perf=50.0)
+        assert len(res) == 1
+        assert res[0].person_id == "p-001"
+        assert res[0].safety_tier == SafetyTier.SAFE
+        assert res[0].to_s2_payload_entry()["posture"] == "standing"
+    finally:
+        engine.shutdown()
+
+

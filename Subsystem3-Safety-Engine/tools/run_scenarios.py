@@ -77,12 +77,16 @@ class RecordingSink:
         self.statuses: list[tuple] = []
         self.alerts: list[ClassifiedEvent] = []
         self.camera_statuses: list[tuple] = []
+        self.activity: list[tuple] = []
 
     def write_status(self, person_id, posture, tier, risk_score, updated_at) -> None:
         self.statuses.append((person_id, posture, tier, risk_score, updated_at))
 
     def write_alert(self, event: ClassifiedEvent) -> None:
         self.alerts.append(event)
+
+    def write_activity(self, *row) -> None:
+        self.activity.append(row)
 
     def write_camera_status(self, camera_id, status, last_seen) -> None:
         self.camera_statuses.append((camera_id, status, last_seen))
@@ -123,7 +127,7 @@ def run_scenario(scenario_name: str, config) -> ScenarioReport:
         config=config.dispatch, sink=report.sink, audio=report.audio, publish=report.published.append
     )
 
-    camera_status_handler = make_camera_status_handler(report.sink, debounce, occupancy, lambda payload: None)
+    camera_status_handler = make_camera_status_handler(report.sink, debounce, occupancy, dispatcher, lambda payload: None)
 
     def on_status_change(snapshot):
         report.camera_snapshots.append(snapshot)

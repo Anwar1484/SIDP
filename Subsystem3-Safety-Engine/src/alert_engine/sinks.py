@@ -21,13 +21,24 @@ logger = logging.getLogger(__name__)
 
 
 class EventSink(Protocol):
-    """Storage target for statuses, alerts and camera status. Dispatcher only talks to this."""
+    """Storage target for statuses, activity, alerts and camera status. Dispatcher only talks to this."""
 
     def write_status(self, person_id: str, posture: str, tier: str, risk_score: int, updated_at: datetime) -> None: ...
 
     def write_alert(self, event: ClassifiedEvent) -> None: ...
 
     def write_camera_status(self, camera_id: str, status: str, last_seen: datetime | None) -> None: ...
+
+    def write_activity(
+        self,
+        person_id: str,
+        camera_id: str,
+        zone: str | None,
+        posture: str,
+        tier: str | None,
+        risk_score: int | None,
+        started_at: datetime,
+    ) -> None: ...
 
 
 class NullSink:
@@ -40,6 +51,18 @@ class NullSink:
         pass
 
     def write_camera_status(self, camera_id: str, status: str, last_seen: datetime | None) -> None:
+        pass
+
+    def write_activity(
+        self,
+        person_id: str,
+        camera_id: str,
+        zone: str | None,
+        posture: str,
+        tier: str | None,
+        risk_score: int | None,
+        started_at: datetime,
+    ) -> None:
         pass
 
 
@@ -72,6 +95,19 @@ CREATE TABLE IF NOT EXISTS camera_status (
     status TEXT NOT NULL,
     last_seen TEXT
 );
+
+CREATE TABLE IF NOT EXISTS activity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    zone TEXT,
+    posture TEXT NOT NULL,
+    tier TEXT,
+    risk_score INTEGER,
+    started_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_person ON activity_log (person_id, id);
 """
 
 _Job = tuple  # (kind: str, args: tuple)
@@ -89,15 +125,13 @@ class LocalSqliteSink:
         self._path = Path(sqlite_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._queue: queue.Queue[_Job | None] = queue.Queue()
-        self._stop_event = threading.Event()
         self._worker = threading.Thread(target=self._run, daemon=True, name="sqlite-sink")
 
     def start(self) -> None:
         self._worker.start()
 
     def stop(self, timeout: float = 2.0) -> None:
-        self._stop_event.set()
-        self._queue.put(None)
+        self._queue.put(None)  # goes behind pending writes, so they are all saved first
         self._worker.join(timeout=timeout)
 
     def write_status(self, person_id: str, posture: str, tier: str, risk_score: int, updated_at: datetime) -> None:
@@ -109,12 +143,24 @@ class LocalSqliteSink:
     def write_camera_status(self, camera_id: str, status: str, last_seen: datetime | None) -> None:
         self._queue.put(("camera_status", (camera_id, status, last_seen.isoformat() if last_seen else None)))
 
+    def write_activity(
+        self,
+        person_id: str,
+        camera_id: str,
+        zone: str | None,
+        posture: str,
+        tier: str | None,
+        risk_score: int | None,
+        started_at: datetime,
+    ) -> None:
+        self._queue.put(("activity", (person_id, camera_id, zone, posture, tier, risk_score, started_at.isoformat())))
+
     def _run(self) -> None:
         conn = sqlite3.connect(self._path, check_same_thread=False)
         try:
             conn.executescript(_SCHEMA)
             conn.commit()
-            while not self._stop_event.is_set():
+            while True:
                 job = self._queue.get()
                 if job is None:
                     self._queue.task_done()
@@ -166,6 +212,14 @@ class LocalSqliteSink:
                 ON CONFLICT(camera_id) DO UPDATE SET status=excluded.status, last_seen=excluded.last_seen
                 """,
                 (camera_id, status, last_seen),
+            )
+        elif kind == "activity":
+            conn.execute(
+                """
+                INSERT INTO activity_log (person_id, camera_id, zone, posture, tier, risk_score, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                args,
             )
         else:
             raise ValueError(f"Unknown sink job kind: {kind}")

@@ -123,7 +123,8 @@ If the chosen device fails, S3 falls back to the OS default speaker.
 
 ## 6b. Phone pop-ups (optional, Telegram bot, needs internet)
 
-S3 can send a text pop-up to staff phones for unsafe and alert events. Text only, no video or images.
+S3 can send a pop-up to staff phones for unsafe and alert events. It is text only unless camera
+photos are turned on (see *Camera photo on alerts* below).
 
 You need the Telegram app and about 3 minutes. Two values are needed: a **bot token** and a **chat ID**.
 
@@ -148,6 +149,9 @@ You need the Telegram app and about 3 minutes. Two values are needed: a **bot to
    `python tools/simulate_publisher.py --scenario fall`. A pop-up should reach the phone within seconds.
    Without these two values the feature stays off and nothing else changes.
 
+If Mahdi has sent you a ready-made `.env` file, put it in the `alert-engine` folder, skip steps 1-4
+and do step 5. Never commit it.
+
 The laptop running S3 needs internet for this. If nothing arrives, the S3 log shows
 `Phone notification failed` with the reason. Each person must have pressed **Start** in the bot chat
 (or be in the group) to receive messages.
@@ -155,6 +159,39 @@ The laptop running S3 needs internet for this. If nothing arrives, the S3 log sh
 By default only emergencies send a message: tier `alert` AND posture `fall` or `lying`
 (set under `notify.tiers` and `notify.postures` in `config/config.yaml`; `postures: []` means any).
 The same per-person cooldown applies, so phones are not spammed.
+
+### Camera photo on alerts (off by default)
+
+With `notify.attach_frame: true`, an alert arrives as one photo with a short caption. This sends
+resident images to Telegram's servers, so R7 must be revised before turning it on.
+
+Until the camera is hooked up, S3 looks for the latest frame at `data/frames/<camera_id>.jpg`, for
+example `data/frames/cam-01.jpg`. Whatever supplies frames should write to a temporary file and then
+rename it, so S3 never reads a half-written picture. On Windows that rename fails while S3 is reading
+the file, so the feed must catch `PermissionError` and try again on its next frame.
+
+If the frame is missing, more than `notify.frame_max_age_s` seconds from the event, or fails to
+upload, the alert is sent as text instead. `data/frames/` is gitignored: never commit resident images.
+
+To test without a camera, run these in separate terminals with S3 already running. The first one
+keeps a labelled dummy picture fresh, and the second triggers one alert:
+```
+python tools/dummy_frames.py --cameras cam-04
+python tools/simulate_publisher.py --scenario fall
+```
+The S3 log then shows `Phone alert sent with photo`, or `sent as text` if it fell back.
+
+## 6c. Activity history
+
+S3 keeps a history of what each resident did in the `activity_log` table of `data/events.db`. A row is
+added only when a confirmed posture or tier changes, so one-frame glitches never appear. To see it:
+```
+python tools/activity_report.py
+python tools/activity_report.py --person p-003 --hours 24
+```
+Each person gets a timeline and totals per posture. An `unmonitored` row means nobody was watching:
+either their camera dropped out or S3 was shut down. If S3 crashes rather than being stopped with
+Ctrl+C, no `unmonitored` row is written, so the last activity before the crash will look too long.
 
 ## 7. Settings you may need to change (`config/config.yaml`)
 
@@ -178,7 +215,8 @@ The same per-person cooldown applies, so phones are not spammed.
 
 - The risk model is trained on **synthetic placeholder data**; it is not yet validated on
   real residents. Retrain with real labelled data: `python tools/train_model.py --csv labelled.csv`.
-- Only event data leaves the vision side. S3 never receives video or images (R7).
+- Only event data leaves the vision side by default. S3 handles images only if
+  `notify.attach_frame` is turned on (see section 6b and R7).
 - Firebase is not built yet. S3 stores locally in `data/events.db` and publishes over MQTT.
 
 Questions about S3: Mahdi.

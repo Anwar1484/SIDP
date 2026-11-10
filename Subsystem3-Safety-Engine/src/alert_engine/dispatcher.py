@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
+from alert_engine.activity import UNMONITORED
 from alert_engine.config import DispatchConfig
 from alert_engine.schemas import ClassifiedEvent
 from alert_engine.sinks import EventSink
@@ -58,6 +59,7 @@ class _PersonDispatchState:
     last_status_write_at: datetime | None = None
     last_alert_key: tuple[str, str] | None = None
     last_alert_at: datetime | None = None
+    last_camera_id: str | None = None
 
 
 class Dispatcher:
@@ -110,12 +112,15 @@ class Dispatcher:
         state = self._people.setdefault(person_id, _PersonDispatchState())
         status_key = (posture, tier)
         status_changed = state.last_status_key != status_key
+        state.last_camera_id = camera_id
 
         self._publish(event.model_dump_json())
         outcome.published = True
 
         if self._should_write_status(state, status_changed, tier, dispatched_at):
             self._sink.write_status(person_id, posture, tier, risk_score, dispatched_at)
+            if status_changed:
+                self._sink.write_activity(person_id, camera_id, zone, posture, tier, risk_score, detected_at)
             state.last_status_key = status_key
             state.last_status_write_at = dispatched_at
             outcome.sink_status_written = True
@@ -142,6 +147,24 @@ class Dispatcher:
                     outcome.audio_repeat = repeat
 
         return outcome
+
+    def mark_unmonitored(self, person_id: str, camera_id: str, at: datetime) -> None:
+        """Log that a person stopped being watched, if this camera last saw them.
+
+        Clearing the status key makes the next confirmed posture start a new activity
+        row, so the history never shows one unbroken period across an outage.
+        """
+        state = self._people.get(person_id)
+        if state is None or state.last_status_key is None or state.last_camera_id != camera_id:
+            return
+        self._sink.write_activity(person_id, camera_id, None, UNMONITORED, None, None, at)
+        state.last_status_key = None
+
+    def mark_all_unmonitored(self, at: datetime) -> None:
+        """Close everyone's activity when the engine shuts down."""
+        for person_id, state in list(self._people.items()):
+            if state.last_camera_id is not None:
+                self.mark_unmonitored(person_id, state.last_camera_id, at)
 
     def _should_write_status(
         self, state: _PersonDispatchState, status_changed: bool, tier: str, dispatched_at: datetime

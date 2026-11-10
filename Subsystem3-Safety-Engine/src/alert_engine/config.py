@@ -75,6 +75,9 @@ class NotifyConfig(BaseModel):
     enabled: bool = True
     tiers: list[str] = Field(default_factory=lambda: ["alert"])
     postures: list[str] = Field(default_factory=lambda: ["fall", "lying"])  # empty = any posture
+    attach_frame: bool = False  # sends camera images to Telegram, see R7
+    frame_dir: str = "data/frames"
+    frame_max_age_s: float = 5.0
 
 
 class Config(BaseModel):

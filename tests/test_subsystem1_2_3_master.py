@@ -96,3 +96,66 @@ def test_subsystem3_four_tier_state_machine_and_3s_bending_escalation(tmp_path):
     finally:
         engine.shutdown()
 
+
+def test_s2_to_s3_payload_interface_and_mahdi_activity_and_frames(tmp_path):
+    """
+    Verifies:
+      1. The canonical S2 -> S3 dictionary interface:
+         `{person_id: {"bbox": [...], "keypoints": [[x, y, conf], ...], "posture": str}}`
+      2. Automatic torso inclination angle calculation from 17 COCO keypoints.
+      3. Mahdi's `activity_log` table & `get_activity_summary()` + `UNMONITORED` tracking.
+      4. Mahdi's `FolderFrameSource` camera frame attachment sync (`update_camera_frame`).
+    """
+    from datetime import datetime, timezone
+
+    engine = Subsystem3SafetyEngine(
+        camera_id="tapo_c210_test",
+        zone_name="living room",
+        audio_enabled=False,
+        telegram_enabled=False,
+        cooldown_seconds=15.0,
+    )
+    try:
+        # Build 17 COCO keypoints representing a ~65 deg forward bend:
+        # Hip at (200, 300), Shoulder at (290, 258) -> dx=90, dy=42 -> ~65 deg
+        kps = [[0.0, 0.0, 0.0] for _ in range(17)]
+        kps[5] = [290.0, 258.0, 0.95]   # left shoulder
+        kps[6] = [290.0, 258.0, 0.95]   # right shoulder
+        kps[11] = [200.0, 300.0, 0.95]  # left hip
+        kps[12] = [200.0, 300.0, 0.95]  # right hip
+
+        s2_payload = {
+            "p-007": {
+                "bbox": [160.0, 140.0, 320.0, 410.0],
+                "keypoints": kps,
+                "posture": "bending",
+            }
+        }
+
+        out_start = engine.evaluate_payload(s2_payload, now_perf=100.0)
+        assert len(out_start) == 1
+        p0 = out_start[0]
+        assert p0.person_id == "p-007"
+        assert p0.track_id == 7
+        assert p0.torso_angle_deg is not None and p0.torso_angle_deg > 60.0
+        assert p0.safety_tier == SafetyTier.WARNING
+
+        # Sustain bending > 3.0s -> escalates to UNSAFE
+        out_unsafe = engine.evaluate_payload(s2_payload, now_perf=103.5)
+        assert out_unsafe[0].safety_tier == SafetyTier.UNSAFE
+
+        # Test camera frame sync for FolderFrameSource
+        dummy_bgr = np.full((240, 320, 3), 128, dtype=np.uint8)
+        engine.update_camera_frame(dummy_bgr, now_perf=104.0)
+        jpg_bytes = engine.frame_source.get_frame("tapo_c210_test", datetime.now(timezone.utc))
+        assert jpg_bytes is not None and jpg_bytes.startswith(b"\xff\xd8")
+
+        # Reset resident -> writes UNMONITORED to activity_log
+        engine.reset_resident("p-007")
+        summary = engine.get_activity_summary("p-007")
+        assert summary is not None
+        assert summary.person_id == "p-007"
+    finally:
+        engine.shutdown()
+
+

@@ -55,6 +55,9 @@ notify:             # Telegram phone pop-ups; needs TELEGRAM_BOT_TOKEN and TELEG
   enabled: true     # without credentials this stays off automatically
   tiers: [alert]            # emergency only; add unsafe to widen
   postures: [fall, lying]   # only these postures send a message ([] = any)
+  attach_frame: true        # sends a photo to Telegram. Dummy image only until R7 is revised
+  frame_dir: data/frames    # latest frame per camera, saved as <camera_id>.jpg
+  frame_max_age_s: 5        # older frames are skipped and the alert goes out as text
 
 sink:
   type: sqlite         # firebase later

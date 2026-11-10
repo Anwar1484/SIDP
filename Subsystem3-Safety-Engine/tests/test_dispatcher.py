@@ -13,9 +13,13 @@ class RecordingSink:
         self.statuses = []
         self.alerts = []
         self.camera_statuses = []
+        self.activity = []
 
     def write_status(self, person_id, posture, tier, risk_score, updated_at):
         self.statuses.append((person_id, posture, tier, risk_score, updated_at))
+
+    def write_activity(self, *row):
+        self.activity.append(row)
 
     def write_alert(self, event):
         self.alerts.append(event)
@@ -171,3 +175,50 @@ def test_people_tracked_independently_for_cooldown(harness):
     dispatch(dispatcher, 0.5, "unsafe", person_id="p-2")
     assert len(sink.alerts) == 2
     assert len(audio.calls) == 2
+
+
+def postures(sink):
+    return [row[3] for row in sink.activity]
+
+
+def test_activity_logs_only_when_posture_or_tier_changes(harness):
+    dispatcher, sink, _, _ = harness
+    dispatch(dispatcher, 0, "safe", posture="walking")
+    dispatch(dispatcher, 1, "safe", posture="walking")
+    dispatch(dispatcher, 5, "warning", posture="bending")
+    dispatch(dispatcher, 9, "warning", posture="bending")
+    dispatch(dispatcher, 11, "unsafe", posture="bending")
+    assert [(row[3], row[4]) for row in sink.activity] == [
+        ("walking", "safe"), ("bending", "warning"), ("bending", "unsafe"),
+    ]
+
+
+def test_unmonitored_row_splits_the_same_posture_after_an_outage(harness):
+    dispatcher, sink, _, _ = harness
+    dispatch(dispatcher, 0, "safe", posture="sitting")
+    dispatcher.mark_unmonitored("p-1", "cam-1", BASE_TIME + timedelta(seconds=1))
+    dispatch(dispatcher, 20, "safe", posture="sitting")
+    assert postures(sink) == ["sitting", "unmonitored", "sitting"]
+
+
+def test_repeat_unmonitored_is_logged_once(harness):
+    dispatcher, sink, _, _ = harness
+    dispatch(dispatcher, 0, "safe", posture="sitting")
+    dispatcher.mark_unmonitored("p-1", "cam-1", BASE_TIME)
+    dispatcher.mark_unmonitored("p-1", "cam-1", BASE_TIME)
+    assert postures(sink) == ["sitting", "unmonitored"]
+
+
+def test_other_camera_dropping_out_does_not_mark_person_unmonitored(harness):
+    dispatcher, sink, _, _ = harness
+    dispatch(dispatcher, 0, "safe", posture="sitting")
+    dispatcher.mark_unmonitored("p-1", "cam-other", BASE_TIME)
+    assert postures(sink) == ["sitting"]
+
+
+def test_shutdown_marks_everyone_unmonitored(harness):
+    dispatcher, sink, _, _ = harness
+    dispatch(dispatcher, 0, "safe", posture="sitting", person_id="p-1")
+    dispatch(dispatcher, 0, "safe", posture="walking", person_id="p-2")
+    dispatcher.mark_all_unmonitored(BASE_TIME + timedelta(seconds=1))
+    assert sorted(row[0] for row in sink.activity if row[3] == "unmonitored") == ["p-1", "p-2"]

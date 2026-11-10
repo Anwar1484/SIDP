@@ -75,11 +75,27 @@ for _p in (WORKSPACE_ROOT, SUBSYSTEM3_SRC):
         sys.path.insert(0, str(_p))
 
 # Import Subsystem 3 core modules from ./Subsystem3-Safety-Engine/src/alert_engine
+from alert_engine.activity import (  # noqa: E402
+    UNMONITORED,
+    ActivityPeriod,
+    ActivitySummary,
+    build_periods,
+    load_rows,
+    summarise,
+)
 from alert_engine.config import Config as S3Config, load_config as load_s3_config  # noqa: E402
 from alert_engine.debounce import DebounceTracker  # noqa: E402
+from alert_engine.frames import FolderFrameSource, FrameSource  # noqa: E402
 from alert_engine.ml_scoring import HybridScorer  # noqa: E402
+from alert_engine.notifier import (  # noqa: E402
+    Notifier,
+    format_caption,
+    format_message,
+    telegram_photo_sender,
+    telegram_sender,
+)
 from alert_engine.schemas import ClassifiedEvent, PostureEventIn  # noqa: E402
-from alert_engine.scoring import ScoreResult  # noqa: E402
+from alert_engine.scoring import ScoreResult, score_posture  # noqa: E402
 from alert_engine.sinks import LocalSqliteSink  # noqa: E402
 
 logging.basicConfig(
@@ -779,6 +795,25 @@ class PersonTelemetry:
     audio_dispatched: bool = False
     telegram_dispatched: bool = False
 
+    def to_s2_payload_entry(self) -> dict[str, Any]:
+        """
+        Formats Subsystem 2 per-person detection data into the canonical
+        Subsystem 2 -> Subsystem 3 interface dictionary:
+          {"bbox": [x1, y1, x2, y2], "keypoints": [[x, y, conf], ...], "posture": str}
+        """
+        return {
+            "bbox": [float(v) for v in self.bbox],
+            "keypoints": [[float(pt[0]), float(pt[1]), float(pt[2])] for pt in self.keypoints_xyc],
+            "posture": self.posture.s3_name,
+            "posture_class": self.posture.value,
+            "confidence": float(self.confidence),
+            "track_id": int(self.track_id),
+            "bend_angle_deg": float(self.torso_angle_deg) if self.torso_angle_deg is not None else None,
+            "knee_angle_deg": float(self.knee_angle_deg) if self.knee_angle_deg is not None else None,
+            "vertical_velocity_mps": float(self.vertical_velocity_mps),
+            "rgb_fall_conf": float(self.rgb_fall_conf) if self.rgb_fall_conf is not None else None,
+        }
+
 
 def compute_joint_angle_deg(
     a: Optional[tuple[float, float]],
@@ -1078,13 +1113,16 @@ class ResidentPersistenceTimer:
     last_audio_tier: Optional[SafetyTier] = None
     last_telegram_ts: float = -float("inf")
     last_status_db_ts: float = -float("inf")
+    last_status_key: Optional[tuple[str, str]] = None
 
 
 class NonBlockingAlertDispatcher:
     """
     Dedicated background daemon threads for:
       1. Local TTS (`pyttsx3`) + acoustic attention tone alerts (`sounddevice` / `pyttsx3`).
-      2. Telegram Bot webhook notifications (`requests.post`).
+      2. Telegram Bot notifications (`alert_engine.notifier`: supports captioned
+         camera JPEG photo uploads via `telegram_photo_sender` + `FolderFrameSource`,
+         with automatic fallback to plain-text `telegram_sender`).
     Enforces a strict 15-second per-resident cooldown so speech synthesis or
     network requests NEVER block or lag the OpenCV video loop or PTZ controls.
     """
@@ -1095,17 +1133,32 @@ class NonBlockingAlertDispatcher:
         audio_enabled: bool = True,
         telegram_enabled: bool = True,
         zone_name: str = "monitoring area",
+        frame_source: Optional[FrameSource] = None,
+        attach_frame: bool = True,
     ) -> None:
         self.cooldown_seconds = cooldown_seconds
         self.audio_enabled = audio_enabled
         self.zone_name = zone_name
+        self.frame_source = frame_source
+        self.attach_frame = attach_frame
 
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         self.telegram_active = bool(telegram_enabled and self.telegram_token and self.telegram_chat_id)
 
+        self._send_text_fn = (
+            telegram_sender(self.telegram_token, self.telegram_chat_id, timeout_s=4.5)
+            if self.telegram_active
+            else None
+        )
+        self._send_photo_fn = (
+            telegram_photo_sender(self.telegram_token, self.telegram_chat_id, timeout_s=5.0)
+            if self.telegram_active
+            else None
+        )
+
         self._speech_queue: queue.Queue[Optional[tuple[SafetyTier, str]]] = queue.Queue(maxsize=8)
-        self._telegram_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=16)
+        self._telegram_queue: queue.Queue[Optional[tuple[Optional[ClassifiedEvent], str]]] = queue.Queue(maxsize=16)
         self._stop_event = threading.Event()
 
         self._speech_thread = threading.Thread(
@@ -1169,24 +1222,50 @@ class NonBlockingAlertDispatcher:
     def _telegram_worker(self) -> None:
         while not self._stop_event.is_set():
             try:
-                msg = self._telegram_queue.get(timeout=0.2)
+                item = self._telegram_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            if msg is None:
+            if item is None:
                 self._telegram_queue.task_done()
                 break
 
+            classified_evt, fallback_text = item
             if self.telegram_active and not self._stop_event.is_set():
-                url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                try:
-                    requests.post(
-                        url,
-                        json={"chat_id": self.telegram_chat_id, "text": msg},
-                        timeout=4.0,
-                    )
-                except Exception as exc:
-                    logger.warning("Telegram webhook notification failed: %s", exc)
+                sent_photo = False
+                if (
+                    self.attach_frame
+                    and classified_evt is not None
+                    and self.frame_source is not None
+                    and self._send_photo_fn is not None
+                ):
+                    try:
+                        frame_bytes = self.frame_source.get_frame(
+                            classified_evt.camera_id,
+                            classified_evt.detected_at,
+                        )
+                        if frame_bytes is not None:
+                            caption = format_caption(classified_evt)
+                            self._send_photo_fn(frame_bytes, caption)
+                            sent_photo = True
+                    except Exception as exc:
+                        logger.warning("Telegram photo upload failed, falling back to text: %s", exc)
+
+                if not sent_photo:
+                    try:
+                        text_to_send = (
+                            format_message(classified_evt)
+                            if (classified_evt is not None and not fallback_text)
+                            else fallback_text
+                        )
+                        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+                        requests.post(
+                            url,
+                            json={"chat_id": self.telegram_chat_id, "text": text_to_send},
+                            timeout=4.0,
+                        )
+                    except Exception as exc:
+                        logger.warning("Telegram webhook notification failed: %s", exc)
             self._telegram_queue.task_done()
 
     def enqueue_speech(self, tier: SafetyTier, message: str) -> bool:
@@ -1204,11 +1283,11 @@ class NonBlockingAlertDispatcher:
         except queue.Full:
             return False
 
-    def enqueue_telegram(self, message: str) -> bool:
+    def enqueue_telegram(self, message: str, event: Optional[ClassifiedEvent] = None) -> bool:
         if not self.telegram_active or self._stop_event.is_set():
             return False
         try:
-            self._telegram_queue.put_nowait(message)
+            self._telegram_queue.put_nowait((event, message))
             return True
         except queue.Full:
             return False
@@ -1233,19 +1312,24 @@ class Subsystem3SafetyEngine:
     """
     Unifies Subsystem 3 (`./Subsystem3-Safety-Engine`) with Subsystem 2's live
     pose telemetry:
+      - Accepts the canonical S2 -> S3 dictionary interface:
+        `{person_id: {"bbox": [...], "keypoints": [[x, y, conf], ...], "posture": str}}`
+        via `evaluate_payload()`, as well as `PersonTelemetry` via `evaluate()`.
       - Loads `Subsystem3-Safety-Engine/config/config.yaml` and `models/risk_model.npz`.
       - Runs `DebounceTracker` and `HybridScorer`.
       - Enforces the 4-tier safety state machine (`Safe`, `Warning`, `Unsafe`, `Alert`)
         and the 3.0-second temporal persistence timer for bending (>60 deg or sustained).
-      - Logs statuses and alerts to SQLite via `LocalSqliteSink`.
-      - Dispatches non-blocking `pyttsx3` voice alerts and Telegram notifications
-        with a 15.0-second per-resident cooldown.
+      - Logs `resident_status`, `alerts`, and Mahdi's new `activity_log` table
+        (with `UNMONITORED` closure on track loss/shutdown) via `LocalSqliteSink`.
+      - Feeds Mahdi's `FolderFrameSource` (`<frame_dir>/<camera_id>.jpg`) for
+        Telegram photo alerts (`notifier.py`).
     """
 
     BENDING_ESCALATION_SECONDS: float = 3.0
     SEVERE_BENDING_ANGLE_DEG: float = 60.0
     LYING_ALERT_ESCALATION_SECONDS: float = 6.0
     RESIDENT_ALERT_COOLDOWN_SECONDS: float = 15.0
+    FRAME_SYNC_INTERVAL_SECONDS: float = 0.50
 
     def __init__(
         self,
@@ -1258,6 +1342,7 @@ class Subsystem3SafetyEngine:
         self.camera_id = camera_id
         self.zone_name = zone_name
         self.cooldown_seconds = cooldown_seconds
+        self._last_frame_sync_ts: float = 0.0
 
         s3_cfg_path = SUBSYSTEM3_ROOT / "config" / "config.yaml"
         self.s3_config: S3Config = load_s3_config(s3_cfg_path)
@@ -1269,6 +1354,18 @@ class Subsystem3SafetyEngine:
         if not sqlite_rel.is_absolute():
             self.s3_config.sink.sqlite_path = str(OUTPUTS_DIR / sqlite_rel.name)
 
+        frame_dir_rel = Path(self.s3_config.notify.frame_dir)
+        if not frame_dir_rel.is_absolute():
+            self.frame_dir = OUTPUTS_DIR / "frames"
+        else:
+            self.frame_dir = frame_dir_rel
+        self.frame_dir.mkdir(parents=True, exist_ok=True)
+        self.s3_config.notify.frame_dir = str(self.frame_dir)
+
+        self.frame_source = FolderFrameSource(
+            self.frame_dir,
+            self.s3_config.notify.frame_max_age_s,
+        )
         self.debounce = DebounceTracker(self.s3_config.debounce)
         self.scorer = HybridScorer.from_config(self.s3_config)
         self.sink = LocalSqliteSink(sqlite_path=self.s3_config.sink.sqlite_path)
@@ -1279,23 +1376,182 @@ class Subsystem3SafetyEngine:
             audio_enabled=audio_enabled,
             telegram_enabled=telegram_enabled,
             zone_name=zone_name,
+            frame_source=self.frame_source,
+            attach_frame=self.s3_config.notify.attach_frame,
         )
         self.timers: dict[str, ResidentPersistenceTimer] = {}
         logger.info(
-            "Subsystem 3 Safety Engine ready (scorer=%s, cooldown=%.1fs, db=%s)",
+            "Subsystem 3 Safety Engine ready (scorer=%s, cooldown=%.1fs, db=%s, frame_dir=%s)",
             self.scorer.mode,
             self.cooldown_seconds,
             self.s3_config.sink.sqlite_path,
+            self.frame_dir,
         )
+
+    def update_camera_frame(self, frame: np.ndarray, now_perf: Optional[float] = None) -> None:
+        now_ts = time.perf_counter() if now_perf is None else now_perf
+        if (now_ts - self._last_frame_sync_ts) < self.FRAME_SYNC_INTERVAL_SECONDS:
+            return
+        self._last_frame_sync_ts = now_ts
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return
+        tmp_path = self.frame_dir / f"{self.camera_id}.tmp"
+        jpg_path = self.frame_dir / f"{self.camera_id}.jpg"
+        try:
+            tmp_path.write_bytes(buf.tobytes())
+            os.replace(str(tmp_path), str(jpg_path))
+        except PermissionError:
+            pass
+        except OSError:
+            pass
+
+    @staticmethod
+    def compute_torso_angle_from_keypoints(
+        keypoints: list[list[float]] | np.ndarray,
+        kp_conf_threshold: float = 0.30,
+    ) -> Optional[float]:
+        kps = np.asarray(keypoints, dtype=np.float32)
+        if kps.shape != (17, 3):
+            return None
+
+        def _pt(idx: int) -> Optional[tuple[float, float]]:
+            x, y, c = float(kps[idx, 0]), float(kps[idx, 1]), float(kps[idx, 2])
+            if c >= kp_conf_threshold and x > 0.0 and y > 0.0 and math.isfinite(x) and math.isfinite(y):
+                return (x, y)
+            return None
+
+        ls, rs = _pt(KP_L_SHOULDER), _pt(KP_R_SHOULDER)
+        lh, rh = _pt(KP_L_HIP), _pt(KP_R_HIP)
+        mid_s = ((ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5) if (ls and rs) else (ls or rs)
+        mid_h = ((lh[0] + rh[0]) * 0.5, (lh[1] + rh[1]) * 0.5) if (lh and rh) else (lh or rh)
+        if mid_s is None or mid_h is None:
+            return None
+        dx = mid_s[0] - mid_h[0]
+        dy = mid_h[1] - mid_s[1]
+        torso_len = math.hypot(dx, dy)
+        if torso_len <= 4.0:
+            return None
+        angle = math.degrees(math.atan2(abs(dx), max(1e-4, abs(dy))))
+        if dy < -0.15 * torso_len:
+            angle = max(angle, 75.0)
+        return angle
+
+    @staticmethod
+    def _parse_posture_class(posture_str: str) -> PostureClass:
+        norm = str(posture_str or "").strip().lower().replace("_", " ").replace("-", " ")
+        mapping = {
+            "standing": PostureClass.STANDING,
+            "stand": PostureClass.STANDING,
+            "sitting": PostureClass.SITTING,
+            "sit": PostureClass.SITTING,
+            "walking": PostureClass.WALKING,
+            "walk": PostureClass.WALKING,
+            "bending": PostureClass.BENDING,
+            "bend": PostureClass.BENDING,
+            "falling": PostureClass.FALLING,
+            "fall": PostureClass.FALLING,
+            "lying down": PostureClass.LYING_DOWN,
+            "lying": PostureClass.LYING_DOWN,
+        }
+        return mapping.get(norm, PostureClass.STANDING)
+
+    def evaluate_payload(
+        self,
+        s2_payload: dict[str, dict[str, Any]],
+        now_perf: Optional[float] = None,
+    ) -> list[PersonTelemetry]:
+        """
+        Evaluates the canonical Subsystem 2 -> Subsystem 3 dictionary payload:
+          `{person_id: {"bbox": [x1, y1, x2, y2], "keypoints": [[x, y, conf], ...], "posture": str}}`
+        and returns a list of `PersonTelemetry` enriched with Subsystem 3's
+        4-tier safety classification, risk score, persistence timers, and alert flags.
+        """
+        now_ts = time.perf_counter() if now_perf is None else now_perf
+        results: list[PersonTelemetry] = []
+        for idx, (person_id, data) in enumerate(s2_payload.items(), start=1):
+            raw_bbox = data.get("bbox", [0.0, 0.0, 100.0, 200.0])
+            bbox = (
+                float(raw_bbox[0]),
+                float(raw_bbox[1]),
+                float(raw_bbox[2]),
+                float(raw_bbox[3]),
+            )
+            raw_kps = data.get("keypoints", np.zeros((17, 3), dtype=np.float32))
+            kps_arr = np.asarray(raw_kps, dtype=np.float32)
+            if kps_arr.shape != (17, 3):
+                kps_arr = np.zeros((17, 3), dtype=np.float32)
+
+            posture_cls = self._parse_posture_class(str(data.get("posture", "standing")))
+            torso_angle = data.get("bend_angle_deg")
+            if torso_angle is None:
+                torso_angle = self.compute_torso_angle_from_keypoints(kps_arr)
+            else:
+                torso_angle = float(torso_angle)
+
+            track_id = int(data.get("track_id") or idx)
+            if person_id.startswith("p-") and person_id[2:].isdigit():
+                track_id = int(person_id[2:])
+
+            telemetry = PersonTelemetry(
+                track_id=track_id,
+                person_id=str(person_id),
+                bbox=bbox,
+                confidence=float(data.get("confidence", 0.90)),
+                keypoints_xyc=kps_arr,
+                posture=posture_cls,
+                torso_angle_deg=torso_angle,
+                knee_angle_deg=float(data["knee_angle_deg"]) if data.get("knee_angle_deg") is not None else None,
+                vertical_velocity_mps=float(data.get("vertical_velocity_mps", 0.0)),
+                rgb_fall_conf=float(data["rgb_fall_conf"]) if data.get("rgb_fall_conf") is not None else None,
+            )
+            results.append(self.evaluate(telemetry, now_ts))
+        return results
 
     def reset_resident(self, person_id: str) -> None:
         self.debounce.reset_person(person_id)
-        self.timers.pop(person_id, None)
+        timer = self.timers.pop(person_id, None)
+        if timer is not None and timer.last_status_key is not None:
+            self.sink.write_activity(
+                person_id,
+                self.camera_id,
+                None,
+                UNMONITORED,
+                None,
+                None,
+                datetime.now(timezone.utc),
+            )
+
+    def mark_all_unmonitored(self) -> None:
+        now_utc = datetime.now(timezone.utc)
+        for person_id, timer in list(self.timers.items()):
+            if timer.last_status_key is not None:
+                self.sink.write_activity(
+                    person_id,
+                    self.camera_id,
+                    None,
+                    UNMONITORED,
+                    None,
+                    None,
+                    now_utc,
+                )
+                timer.last_status_key = None
+
+    def get_activity_summary(self, person_id: str) -> Optional[ActivitySummary]:
+        try:
+            rows = load_rows(self.s3_config.sink.sqlite_path, person_id=person_id)
+            periods = build_periods(rows, datetime.now(timezone.utc))
+            return summarise(periods, person_id)
+        except Exception:
+            return None
 
     def evaluate(self, telemetry: PersonTelemetry, now_perf: float) -> PersonTelemetry:
         now_utc = datetime.now(timezone.utc)
         person_id = telemetry.person_id
         s3_posture = telemetry.posture.s3_name
+
+        if telemetry.torso_angle_deg is None:
+            telemetry.torso_angle_deg = self.compute_torso_angle_from_keypoints(telemetry.keypoints_xyc)
 
         timer = self.timers.get(person_id)
         if timer is None:
@@ -1396,7 +1652,21 @@ class Subsystem3SafetyEngine:
         telemetry.severe_bend_duration_s = severe_bend_duration_s
         telemetry.safety_reasons = reasons
 
-        if (now_perf - timer.last_status_db_ts) >= 2.0 or debounced.changed:
+        status_key = (s3_posture, tier.value)
+        status_changed = (timer.last_status_key != status_key)
+        if status_changed:
+            timer.last_status_key = status_key
+            self.sink.write_activity(
+                person_id,
+                self.camera_id,
+                self.zone_name,
+                s3_posture,
+                tier.value,
+                telemetry.risk_score,
+                now_utc,
+            )
+
+        if status_changed or (now_perf - timer.last_status_db_ts) >= self.s3_config.dispatch.status_min_interval_s or debounced.changed:
             timer.last_status_db_ts = now_perf
             self.sink.write_status(person_id, s3_posture, tier.value, telemetry.risk_score, now_utc)
 
@@ -1424,16 +1694,23 @@ class Subsystem3SafetyEngine:
                 )
                 self.sink.write_alert(classified_evt)
 
+                base_template = self.s3_config.audio.messages.get(tier.value, "")
+                base_phrase = base_template.format(zone=self.zone_name) if base_template else ""
                 if tier == SafetyTier.ALERT:
                     speech_msg = (
-                        f"Emergency Alert! Resident {telemetry.track_id} {telemetry.posture.value.lower()} "
-                        f"detected in the {self.zone_name}. Please check immediately."
+                        f"{base_phrase} Resident {telemetry.track_id} {telemetry.posture.value.lower()}."
+                        if base_phrase
+                        else f"Alert. Possible fall detected in the {self.zone_name}. Please check immediately."
                     )
                 else:
                     angle_info = f" at {telemetry.torso_angle_deg:.0f} degrees" if telemetry.torso_angle_deg else ""
                     speech_msg = (
-                        f"Safety Warning. Resident {telemetry.track_id} unsafe {telemetry.posture.value.lower()}"
-                        f"{angle_info} sustained for {effective_duration_s:.0f} seconds."
+                        f"{base_phrase} Resident {telemetry.track_id} {telemetry.posture.value.lower()}{angle_info}."
+                        if base_phrase
+                        else (
+                            f"Warning. Unsafe posture detected in the {self.zone_name}. "
+                            f"Resident {telemetry.track_id} {telemetry.posture.value.lower()}{angle_info}."
+                        )
                     )
 
                 telemetry.audio_dispatched = self.alert_dispatcher.enqueue_speech(tier, speech_msg)
@@ -1445,7 +1722,7 @@ class Subsystem3SafetyEngine:
                     f"Risk Score: {telemetry.risk_score}/100 (Duration: {effective_duration_s:.1f}s)\n"
                     f"Reason: {reasons[0] if reasons else 'Safety threshold exceeded'}"
                 )
-                telemetry.telegram_dispatched = self.alert_dispatcher.enqueue_telegram(tg_text)
+                telemetry.telegram_dispatched = self.alert_dispatcher.enqueue_telegram(tg_text, event=classified_evt)
                 logger.warning(
                     "S3 ALERT DISPATCHED | resident=%s tier=%s posture=%s score=%d duration=%.1fs",
                     person_id,
@@ -1458,6 +1735,7 @@ class Subsystem3SafetyEngine:
         return telemetry
 
     def shutdown(self) -> None:
+        self.mark_all_unmonitored()
         self.alert_dispatcher.shutdown()
         self.sink.stop()
 
@@ -2626,6 +2904,7 @@ class UnifiedVisionSafetyPipeline:
         camera_moving: bool = False,
     ) -> list[PersonTelemetry]:
         h, w = frame.shape[:2]
+        self.safety_engine.update_camera_frame(frame, timestamp)
         stale_ids = self.posture_engine.prune_stale_tracks(timestamp)
         for tid in stale_ids:
             self.safety_engine.reset_resident(f"p-{tid:03d}")
@@ -2669,7 +2948,7 @@ class UnifiedVisionSafetyPipeline:
 
         fall_boxes = self._infer_secondary_fall(frame, timestamp)
 
-        outputs: list[PersonTelemetry] = []
+        s2_payload: dict[str, dict[str, Any]] = {}
         for tid, bbox, det_conf, kps in zip(track_ids, raw_bboxes, confs, kps_data):
             if kps.shape != (17, 3):
                 continue
@@ -2690,10 +2969,9 @@ class UnifiedVisionSafetyPipeline:
                 rgb_fall_confidence=matched_fall_conf,
                 camera_moving=camera_moving,
             )
-            telemetry = self.safety_engine.evaluate(telemetry, timestamp)
-            outputs.append(telemetry)
+            s2_payload[telemetry.person_id] = telemetry.to_s2_payload_entry()
 
-        return outputs
+        return self.safety_engine.evaluate_payload(s2_payload, timestamp)
 
 
 # ==============================================================================

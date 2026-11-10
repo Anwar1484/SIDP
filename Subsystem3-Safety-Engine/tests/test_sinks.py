@@ -130,3 +130,31 @@ def test_bad_job_does_not_crash_worker(tmp_path):
 
     rows = query_all(tmp_path, "resident_status")
     assert len(rows) == 1  # worker kept running after the bad job
+
+
+def test_write_activity_appends_a_row_per_change(tmp_path):
+    sink = make_sink(tmp_path)
+    at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    sink.write_activity("p-1", "cam-1", "lounge", "walking", "safe", 10, at)
+    sink.write_activity("p-1", "cam-1", "lounge", "bending", "warning", 45, at)
+    sink.stop()
+    rows = query_all(tmp_path, "activity_log")
+    assert [r["posture"] for r in rows] == ["walking", "bending"]
+    assert rows[0]["camera_id"] == "cam-1" and rows[0]["started_at"] == at.isoformat()
+
+
+def test_unmonitored_activity_has_no_tier_or_score(tmp_path):
+    sink = make_sink(tmp_path)
+    sink.write_activity("p-1", "cam-1", None, "unmonitored", None, None, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sink.stop()
+    row = query_all(tmp_path, "activity_log")[0]
+    assert row["tier"] is None and row["risk_score"] is None
+
+
+def test_stop_saves_every_queued_write(tmp_path):
+    sink = make_sink(tmp_path)
+    at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(300):
+        sink.write_activity(f"p-{i}", "cam-1", None, "walking", "safe", 10, at)
+    sink.stop(timeout=30)
+    assert len(query_all(tmp_path, "activity_log")) == 300

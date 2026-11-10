@@ -14,6 +14,7 @@ from alert_engine.audio import AudioController
 from alert_engine.config import Config, load_config
 from alert_engine.debounce import DebounceTracker
 from alert_engine.dispatcher import Dispatcher
+from alert_engine.frames import FolderFrameSource
 from alert_engine.metrics import MetricsLogger
 from alert_engine.mqtt_client import MqttClient
 from alert_engine.schemas import AudioDeviceSelect, PostureEventIn, PostureRejectedError, validate_posture
@@ -81,7 +82,11 @@ class CameraOccupancy:
 
 
 def make_camera_status_handler(
-    sink: EventSink, debounce: DebounceTracker, occupancy: CameraOccupancy, publish_camera_status
+    sink: EventSink,
+    debounce: DebounceTracker,
+    occupancy: CameraOccupancy,
+    dispatcher: Dispatcher,
+    publish_camera_status,
 ):
     previous_status: dict[str, str] = {}
 
@@ -98,6 +103,8 @@ def make_camera_status_handler(
                 # scratch rather than resuming a duration_s spanning the gap.
                 for person_id in occupancy.people_on(camera_id):
                     debounce.reset_person(person_id)
+                    if last_seen is not None:
+                        dispatcher.mark_unmonitored(person_id, camera_id, last_seen)
                     logger.info("Camera %s unmonitored; reset debounce state for person %s", camera_id, person_id)
             previous_status[camera_id] = status
 
@@ -190,7 +197,10 @@ def make_posture_handler(
 def main() -> None:
     load_dotenv()
     config = load_config("config/config.yaml")
-    notifier = Notifier.from_env(config.notify.tiers, enabled=config.notify.enabled, postures=config.notify.postures)
+    frames = FolderFrameSource(config.notify.frame_dir, config.notify.frame_max_age_s) if config.notify.attach_frame else None
+    notifier = Notifier.from_env(
+        config.notify.tiers, enabled=config.notify.enabled, postures=config.notify.postures, frames=frames
+    )
     rejection_logger = RejectionLogger()
     metrics = MetricsLogger()
     debounce = DebounceTracker(config.debounce)
@@ -215,7 +225,8 @@ def main() -> None:
     watchdog = CameraWatchdog(
         camera_timeout_s=config.watchdog.camera_timeout_s,
         on_status_change=make_camera_status_handler(
-            sink, debounce, occupancy, lambda payload: client.publish(CAMERA_STATUS_TOPIC, payload, qos=1, retain=True)
+            sink, debounce, occupancy, dispatcher,
+            lambda payload: client.publish(CAMERA_STATUS_TOPIC, payload, qos=1, retain=True),
         ),
     )
 
@@ -246,6 +257,7 @@ def main() -> None:
         watchdog.stop_polling()
         audio.stop()
         notifier.stop()
+        dispatcher.mark_all_unmonitored(datetime.now(timezone.utc))
         sink.stop()
         client.disconnect()
 
