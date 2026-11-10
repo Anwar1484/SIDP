@@ -70,6 +70,7 @@ def test_icd03_sqlite_schema_and_seed_residents(tmp_path: Path) -> None:
         raw_frame_path=raw_file,
         annotated_frame_path=ann_file,
         snapshots_dir=snaps_dir,
+        captures_dir=tmp_path / "captures",
     )
     try:
         state = bridge.get_live_state_dict()
@@ -105,6 +106,7 @@ def test_icd03_throttled_events_and_immediate_alert_snapshots(tmp_path: Path) ->
         raw_frame_path=raw_file,
         annotated_frame_path=ann_file,
         snapshots_dir=snaps_dir,
+        captures_dir=tmp_path / "captures",
     )
     try:
         raw_img = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -174,6 +176,12 @@ def test_icd03_throttled_events_and_immediate_alert_snapshots(tmp_path: Path) ->
         assert res1_status["safety_tier"] == "alert"
         assert raw_file.is_file()
         assert ann_file.is_file()
+
+        # Verify date-partitioned incident snapshot archiving (`captures/YYYY-MM-DD/alert/HH-MM-SS_resident_1.jpg`)
+        archived_list = bridge.list_archived_captures()
+        assert len(archived_list) == 1
+        assert archived_list[0]["tier"] == "alert"
+        assert archived_list[0]["filename"].endswith("_resident_1.jpg")
     finally:
         bridge.shutdown()
 
@@ -186,6 +194,7 @@ def test_icd03_http_server_endpoints(tmp_path: Path) -> None:
         raw_frame_path=tmp_path / "raw.jpg",
         annotated_frame_path=tmp_path / "ann.jpg",
         snapshots_dir=tmp_path / "snapshots",
+        captures_dir=tmp_path / "captures",
     )
     server = ICD03DashboardHTTPServer(bridge=bridge, host="127.0.0.1", port=0)
     try:
@@ -216,12 +225,36 @@ def test_icd03_http_server_endpoints(tmp_path: Path) -> None:
         img_resp = requests.get(f"{base_url}/api/icd03/raw.jpg", timeout=3.0)
         assert img_resp.status_code == 200
         assert img_resp.headers["Content-Type"] == "image/jpeg"
+
+        # 4. Trigger an incident snapshot and fetch via /api/icd03/captures and /captures/...
+        dummy_frame = np.full((240, 320, 3), 90, dtype=np.uint8)
+        p_warn = _dummy_person(track_id=2, posture=PostureClass.BENDING, tier=SafetyTier.WARNING, torso_angle=52.0)
+        bridge.publish_frame_and_telemetry(
+            raw_frame=dummy_frame,
+            annotated_frame=dummy_frame,
+            persons=[p_warn],
+            camera_mode=CameraMode.MANUAL,
+            fps=25.0,
+            now_perf=30.0,
+        )
+        bridge.flush()
+
+        cap_resp = requests.get(f"{base_url}/api/icd03/captures", timeout=3.0)
+        assert cap_resp.status_code == 200
+        caps = cap_resp.json()["captures"]
+        assert len(caps) == 1
+        assert caps[0]["tier"] == "warning"
+        assert caps[0]["filename"].endswith("_resident_2.jpg")
+
+        cap_img_resp = requests.get(f"{base_url}{caps[0]['url']}", timeout=3.0)
+        assert cap_img_resp.status_code == 200
+        assert cap_img_resp.headers["Content-Type"] == "image/jpeg"
     finally:
         server.stop()
         bridge.shutdown()
 
 
-def test_master_1234_s2_s3_payload_interface() -> None:
+def test_master_1234_s2_s3_payload_interface(tmp_path: Path) -> None:
     from subsystem1_2_3_4_master import Subsystem3SafetyEngine
 
     engine = Subsystem3SafetyEngine(
@@ -229,6 +262,7 @@ def test_master_1234_s2_s3_payload_interface() -> None:
         zone_name="bedroom",
         audio_enabled=False,
         telegram_enabled=False,
+        captures_root=tmp_path / "captures",
     )
     try:
         kps = [[200.0, 150.0, 0.9] for _ in range(17)]

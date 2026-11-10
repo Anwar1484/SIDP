@@ -31,6 +31,7 @@ import streamlit.components.v1 as components
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 OUTPUTS_DIR = WORKSPACE_ROOT / "outputs"
+CAPTURES_DIR = WORKSPACE_ROOT / "captures"
 DB_PATH = OUTPUTS_DIR / "sidp_subsystem4.db"
 LIVE_RAW_JPG = OUTPUTS_DIR / "live_raw.jpg"
 LIVE_ANNOTATED_JPG = OUTPUTS_DIR / "live_annotated.jpg"
@@ -386,6 +387,27 @@ def main() -> None:
         else:
             st.info("No posture telemetry events recorded yet.")
 
+        st.divider()
+        st.markdown("#### 📸 Archived CCTV Incident Snapshots (`captures/YYYY-MM-DD/{warning,unsafe,alert}/`)")
+        if CAPTURES_DIR.is_dir():
+            jpg_files = sorted(
+                CAPTURES_DIR.rglob("*.jpg"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            )[:12]
+            if jpg_files:
+                cols = st.columns(3)
+                for idx, jpg_path in enumerate(jpg_files):
+                    rel_str = jpg_path.relative_to(WORKSPACE_ROOT).as_posix()
+                    img_data = _read_image_bytes(jpg_path)
+                    if img_data:
+                        with cols[idx % 3]:
+                            st.image(img_data, caption=rel_str, use_container_width=True)
+            else:
+                st.info("No incident snapshots archived in `captures/` yet.")
+        else:
+            st.info("Directory `captures/` will be created automatically upon the first Warning, Unsafe, or Alert incident.")
+
     with tab_sbadmin:
         st.markdown(
             "Embedded **Subsystem 4 SB Admin 2 Caregiver Portal** served live by `subsystem1_2_3_4_master.py` at "
@@ -400,3 +422,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

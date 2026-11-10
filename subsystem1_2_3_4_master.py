@@ -69,6 +69,7 @@ SUBSYSTEM4_ROOT = WORKSPACE_ROOT / "Subsystem4-Dashboard"
 SUBSYSTEM4_WEB_ROOT = SUBSYSTEM4_ROOT / "elderly_monitoring_system"
 OUTPUTS_DIR = WORKSPACE_ROOT / "outputs"
 SNAPSHOTS_DIR = OUTPUTS_DIR / "snapshots"
+CAPTURES_DIR = WORKSPACE_ROOT / "captures"
 
 for _p in (WORKSPACE_ROOT, SUBSYSTEM3_SRC):
     if _p.exists() and str(_p) not in sys.path:
@@ -794,6 +795,7 @@ class PersonTelemetry:
     safety_reasons: list[str] = field(default_factory=list)
     audio_dispatched: bool = False
     telegram_dispatched: bool = False
+    snapshot_path: Optional[str] = None
 
     def to_s2_payload_entry(self) -> dict[str, Any]:
         """
@@ -1308,6 +1310,212 @@ class NonBlockingAlertDispatcher:
             self._telegram_thread.join(timeout=1.5)
 
 
+class IncidentSnapshotArchiver:
+    """
+    Automated CCTV Incident Snapshot & Date-Partitioned Directory Archiver
+    (Subsystem 3 & 4 Interface).
+
+    Dynamically creates and populates the date- and severity-partitioned hierarchy:
+        captures/
+        └── YYYY-MM-DD/
+            ├── warning/
+            │   └── HH-MM-SS_resident_<id>.jpg
+            ├── unsafe/
+            │   └── HH-MM-SS_resident_<id>.jpg
+            └── alert/
+                └── HH-MM-SS_resident_<id>.jpg
+    """
+
+    INCIDENT_TIERS: tuple[SafetyTier, ...] = (
+        SafetyTier.WARNING,
+        SafetyTier.UNSAFE,
+        SafetyTier.ALERT,
+    )
+
+    def __init__(
+        self,
+        captures_root: Path = CAPTURES_DIR,
+        cooldown_seconds: float = 15.0,
+        jpeg_quality: int = 90,
+    ) -> None:
+        self.captures_root = Path(captures_root)
+        self.cooldown_seconds = float(cooldown_seconds)
+        self.jpeg_quality = int(jpeg_quality)
+
+        self._last_tier: dict[str, SafetyTier] = {}
+        self._last_capture_ts: dict[tuple[str, SafetyTier], float] = {}
+        self._write_queue: queue.Queue[Optional[tuple[Path, np.ndarray]]] = queue.Queue(maxsize=64)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._writer_loop,
+            name="SIDP-Incident-Archiver",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @staticmethod
+    def format_resident_id(resident_id: int | str) -> str:
+        raw = str(resident_id).strip()
+        if raw.lower().startswith("resident_"):
+            raw = raw[9:]
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in raw)
+        return safe or "1"
+
+    def build_snapshot_path(
+        self,
+        tier: SafetyTier | str,
+        resident_id: int | str,
+        dt: Optional[datetime] = None,
+    ) -> Path:
+        now_dt = dt if dt is not None else datetime.now()
+        date_folder = now_dt.strftime("%Y-%m-%d")
+        time_prefix = now_dt.strftime("%H-%M-%S")
+        tier_folder = (tier.value if isinstance(tier, SafetyTier) else str(tier)).strip().lower()
+        if tier_folder not in ("warning", "unsafe", "alert"):
+            tier_folder = "warning"
+
+        res_tag = self.format_resident_id(resident_id)
+        target_dir = self.captures_root / date_folder / tier_folder
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir / f"{time_prefix}_resident_{res_tag}.jpg"
+
+    @staticmethod
+    def render_incident_frame(
+        frame: Optional[np.ndarray],
+        telemetry: PersonTelemetry,
+        dt: Optional[datetime] = None,
+    ) -> np.ndarray:
+        if frame is None:
+            canvas = np.full((480, 640, 3), 18, dtype=np.uint8)
+        else:
+            canvas = frame.copy()
+
+        h, w = canvas.shape[:2]
+        now_dt = dt if dt is not None else datetime.now()
+        ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        if telemetry.safety_tier == SafetyTier.WARNING:
+            color = (0, 215, 255)
+        elif telemetry.safety_tier == SafetyTier.UNSAFE:
+            color = (25, 25, 230)
+        else:
+            color = (15, 15, 255)
+
+        x1 = int(round(clamp(telemetry.bbox[0], 0.0, float(w - 1))))
+        y1 = int(round(clamp(telemetry.bbox[1], 0.0, float(h - 1))))
+        x2 = int(round(clamp(telemetry.bbox[2], 0.0, float(w - 1))))
+        y2 = int(round(clamp(telemetry.bbox[3], 0.0, float(h - 1))))
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+
+        cv2.rectangle(canvas, (0, h - 30), (w, h), (12, 12, 12), -1)
+        angle_txt = f"{telemetry.torso_angle_deg:.0f}deg" if telemetry.torso_angle_deg is not None else "N/A"
+        stamp = (
+            f"{ts_str} | Resident #{telemetry.track_id} ({telemetry.person_id}) | "
+            f"Tier: {telemetry.safety_tier.value.upper()} | Posture: {telemetry.posture.value} | "
+            f"Torso: {angle_txt} | Risk: {telemetry.risk_score}/100"
+        )
+        cv2.putText(
+            canvas,
+            stamp,
+            (10, h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        return canvas
+
+    def reset_resident(self, person_id: str) -> None:
+        self._last_tier.pop(person_id, None)
+        for key in [k for k in self._last_capture_ts if k[0] == person_id]:
+            self._last_capture_ts.pop(key, None)
+
+    def maybe_archive(
+        self,
+        telemetry: PersonTelemetry,
+        frame: Optional[np.ndarray],
+        now_perf: Optional[float] = None,
+        dt: Optional[datetime] = None,
+        annotate: bool = True,
+    ) -> Optional[Path]:
+        tier = telemetry.safety_tier
+        person_id = telemetry.person_id
+
+        if tier not in self.INCIDENT_TIERS:
+            self._last_tier[person_id] = SafetyTier.SAFE
+            return None
+
+        now_ts = time.perf_counter() if now_perf is None else now_perf
+        prev_tier = self._last_tier.get(person_id, SafetyTier.SAFE)
+        tier_changed = (tier != prev_tier)
+        last_ts = self._last_capture_ts.get((person_id, tier), -float("inf"))
+        cooldown_elapsed = (now_ts - last_ts) >= self.cooldown_seconds
+
+        if not (tier_changed or cooldown_elapsed):
+            return None
+
+        self._last_tier[person_id] = tier
+        self._last_capture_ts[(person_id, tier)] = now_ts
+
+        target_path = self.build_snapshot_path(tier, telemetry.track_id, dt=dt)
+        img_to_save = (
+            self.render_incident_frame(frame, telemetry, dt=dt)
+            if annotate or frame is None
+            else frame.copy()
+        )
+
+        if self._write_queue.full():
+            try:
+                self._write_queue.get_nowait()
+                self._write_queue.task_done()
+            except queue.Empty:
+                pass
+        try:
+            self._write_queue.put_nowait((target_path, img_to_save))
+        except queue.Full:
+            pass
+
+        telemetry.snapshot_path = target_path.as_posix()
+        return target_path
+
+    def _writer_loop(self) -> None:
+        while not self._stop_event.is_set() or not self._write_queue.empty():
+            try:
+                item = self._write_queue.get(timeout=0.15)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                self._write_queue.task_done()
+                break
+
+            target_path, img = item
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+                if ok:
+                    tmp_path = target_path.with_suffix(".jpg.tmp")
+                    tmp_path.write_bytes(buf.tobytes())
+                    os.replace(str(tmp_path), str(target_path))
+            except Exception as exc:
+                logger.warning("IncidentSnapshotArchiver write error (%s): %s", target_path, exc)
+            finally:
+                self._write_queue.task_done()
+
+    def flush(self) -> None:
+        self._write_queue.join()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        try:
+            self._write_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+
+
 class Subsystem3SafetyEngine:
     """
     Unifies Subsystem 3 (`./Subsystem3-Safety-Engine`) with Subsystem 2's live
@@ -1319,6 +1527,7 @@ class Subsystem3SafetyEngine:
       - Runs `DebounceTracker` and `HybridScorer`.
       - Enforces the 4-tier safety state machine (`Safe`, `Warning`, `Unsafe`, `Alert`)
         and the 3.0-second temporal persistence timer for bending (>60 deg or sustained).
+      - Archives CCTV incident snapshots to `captures/YYYY-MM-DD/{warning,unsafe,alert}/HH-MM-SS_resident_<id>.jpg`.
       - Logs `resident_status`, `alerts`, and Mahdi's new `activity_log` table
         (with `UNMONITORED` closure on track loss/shutdown) via `LocalSqliteSink`.
       - Feeds Mahdi's `FolderFrameSource` (`<frame_dir>/<camera_id>.jpg`) for
@@ -1338,11 +1547,13 @@ class Subsystem3SafetyEngine:
         audio_enabled: bool = True,
         telegram_enabled: bool = True,
         cooldown_seconds: float = 15.0,
+        captures_root: Path = CAPTURES_DIR,
     ) -> None:
         self.camera_id = camera_id
         self.zone_name = zone_name
         self.cooldown_seconds = cooldown_seconds
         self._last_frame_sync_ts: float = 0.0
+        self._latest_frame: Optional[np.ndarray] = None
 
         s3_cfg_path = SUBSYSTEM3_ROOT / "config" / "config.yaml"
         self.s3_config: S3Config = load_s3_config(s3_cfg_path)
@@ -1371,6 +1582,11 @@ class Subsystem3SafetyEngine:
         self.sink = LocalSqliteSink(sqlite_path=self.s3_config.sink.sqlite_path)
         self.sink.start()
 
+        self.snapshot_archiver = IncidentSnapshotArchiver(
+            captures_root=captures_root,
+            cooldown_seconds=cooldown_seconds,
+        )
+
         self.alert_dispatcher = NonBlockingAlertDispatcher(
             cooldown_seconds=cooldown_seconds,
             audio_enabled=audio_enabled,
@@ -1381,14 +1597,15 @@ class Subsystem3SafetyEngine:
         )
         self.timers: dict[str, ResidentPersistenceTimer] = {}
         logger.info(
-            "Subsystem 3 Safety Engine ready (scorer=%s, cooldown=%.1fs, db=%s, frame_dir=%s)",
+            "Subsystem 3 Safety Engine ready (scorer=%s, cooldown=%.1fs, db=%s, captures=%s)",
             self.scorer.mode,
             self.cooldown_seconds,
             self.s3_config.sink.sqlite_path,
-            self.frame_dir,
+            self.snapshot_archiver.captures_root,
         )
 
     def update_camera_frame(self, frame: np.ndarray, now_perf: Optional[float] = None) -> None:
+        self._latest_frame = frame.copy()
         now_ts = time.perf_counter() if now_perf is None else now_perf
         if (now_ts - self._last_frame_sync_ts) < self.FRAME_SYNC_INTERVAL_SECONDS:
             return
@@ -1510,6 +1727,7 @@ class Subsystem3SafetyEngine:
 
     def reset_resident(self, person_id: str) -> None:
         self.debounce.reset_person(person_id)
+        self.snapshot_archiver.reset_resident(person_id)
         timer = self.timers.pop(person_id, None)
         if timer is not None and timer.last_status_key is not None:
             self.sink.write_activity(
@@ -1652,6 +1870,18 @@ class Subsystem3SafetyEngine:
         telemetry.severe_bend_duration_s = severe_bend_duration_s
         telemetry.safety_reasons = reasons
 
+        archived_path = self.snapshot_archiver.maybe_archive(
+            telemetry=telemetry,
+            frame=self._latest_frame,
+            now_perf=now_perf,
+        )
+        if archived_path is not None:
+            logger.info(
+                "Archived %s incident snapshot -> %s",
+                tier.value.upper(),
+                archived_path,
+            )
+
         status_key = (s3_posture, tier.value)
         status_changed = (timer.last_status_key != status_key)
         if status_changed:
@@ -1736,6 +1966,7 @@ class Subsystem3SafetyEngine:
 
     def shutdown(self) -> None:
         self.mark_all_unmonitored()
+        self.snapshot_archiver.shutdown()
         self.alert_dispatcher.shutdown()
         self.sink.stop()
 
@@ -1800,15 +2031,19 @@ class ICD03DataBridge:
         raw_frame_path: Path = OUTPUTS_DIR / "live_raw.jpg",
         annotated_frame_path: Path = OUTPUTS_DIR / "live_annotated.jpg",
         snapshots_dir: Path = SNAPSHOTS_DIR,
+        captures_dir: Path = CAPTURES_DIR,
     ) -> None:
         self.db_path = db_path
         self.live_state_path = live_state_path
         self.raw_frame_path = raw_frame_path
         self.annotated_frame_path = annotated_frame_path
         self.snapshots_dir = snapshots_dir
+        self.captures_dir = Path(captures_dir)
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.captures_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshot_archiver = IncidentSnapshotArchiver(captures_root=self.captures_dir)
 
         self._state_lock = threading.Lock()
         self._frame_lock = threading.Lock()
@@ -2211,6 +2446,14 @@ class ICD03DataBridge:
                     and (transitioned or p.audio_dispatched or p.telegram_dispatched)
                 )
                 if should_log_incident:
+                    if not p.snapshot_path:
+                        self.snapshot_archiver.maybe_archive(
+                            telemetry=p,
+                            frame=annotated_frame,
+                            now_perf=now_ts,
+                            annotate=False,
+                        )
+
                     alert_id = f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}_{p.track_id}"
                     snapshot_rel_url = f"/snapshots/{alert_id}.jpg"
                     snapshot_bytes = self.get_annotated_jpeg() or self.get_raw_jpeg()
@@ -2230,6 +2473,7 @@ class ICD03DataBridge:
                         "severity": s4_fields["severity"],
                         "notes": s4_fields["notes"],
                         "snapshot_url": snapshot_rel_url if snapshot_bytes else "",
+                        "snapshot_path": p.snapshot_path or "",
                         "snapshot_captured_at": now_iso if snapshot_bytes else "",
                     }
                     with self._state_lock:
@@ -2467,12 +2711,42 @@ class ICD03DataBridge:
             finally:
                 self._write_queue.task_done()
 
+    def list_archived_captures(self, limit: int = 50) -> list[dict[str, str]]:
+        items: list[tuple[float, dict[str, str]]] = []
+        if not self.captures_dir.is_dir():
+            return []
+        for jpg in self.captures_dir.rglob("*.jpg"):
+            try:
+                rel = jpg.relative_to(self.captures_dir).as_posix()
+                parts = rel.split("/")
+                date_str = parts[0] if len(parts) >= 3 else ""
+                tier_str = parts[1] if len(parts) >= 3 else ""
+                mtime = jpg.stat().st_mtime
+                items.append(
+                    (
+                        mtime,
+                        {
+                            "date": date_str,
+                            "tier": tier_str,
+                            "filename": jpg.name,
+                            "relative_path": f"captures/{rel}",
+                            "url": f"/captures/{rel}",
+                        },
+                    )
+                )
+            except OSError:
+                continue
+        items.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _, entry in items[:limit]]
+
     def flush(self, timeout: float = 3.0) -> None:
+        self.snapshot_archiver.flush()
         self._write_queue.join()
         self._write_live_state_json()
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        self.snapshot_archiver.shutdown()
         try:
             self._write_queue.put_nowait(None)
         except queue.Full:
@@ -2613,6 +2887,23 @@ class _ICD03RequestHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_single_jpeg(snap_path.read_bytes())
             else:
                 self.send_error(404, "Snapshot not found")
+            return
+
+        if route == "/api/icd03/captures":
+            self._send_json(200, {"captures": self.bridge.list_archived_captures()})
+            return
+
+        if route.startswith("/captures/"):
+            rel_part = route[len("/captures/"):].lstrip("/")
+            candidate = (self.bridge.captures_dir / rel_part).resolve()
+            try:
+                candidate.relative_to(self.bridge.captures_dir.resolve())
+                if candidate.is_file() and candidate.suffix.lower() == ".jpg":
+                    self._send_single_jpeg(candidate.read_bytes())
+                    return
+            except ValueError:
+                pass
+            self.send_error(404, "Archived capture not found")
             return
 
         super().do_GET()
