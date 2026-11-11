@@ -22,6 +22,22 @@ def test_message_has_tier_zone_and_resident():
     assert "ALERT" in text and "lounge" in text and "p-003" in text
 
 
+def test_message_layout_has_person_event_location_duration_only():
+    assert format_message(make_event()) == (
+        "ALERT: p-003 has fallen\nLocation: lounge\nDuration: 2.5 s"
+    )
+
+
+def test_message_leaves_out_score_and_reasons():
+    text = format_message(make_event())
+    assert "90" not in text and "risk" not in text and "severity" not in text
+
+
+def test_message_uses_camera_when_zone_missing():
+    event = make_event().model_copy(update={"zone": None})
+    assert "Location: cam-01" in format_message(event)
+
+
 def test_only_configured_tiers_are_queued():
     n = Notifier({"unsafe", "alert"}, send=lambda t: None)
     assert n.notify(make_event("alert")) is True

@@ -35,21 +35,28 @@ SendFn = Callable[[str], None]
 SendPhotoFn = Callable[[bytes, str], None]
 
 
+POSTURE_PHRASE = {"fall": "has fallen", "lying": "is lying down", "bending": "is bending"}
+
+
 def format_caption(event: ClassifiedEvent) -> str:
-    """Short photo caption for one classified event."""
+    """Staff-facing alert text: who, what happened, where and for how long.
+
+    Scores and reasons are left out on purpose; they stay in alert/events and the sink.
+    """
     where = event.zone or event.camera_id
     label = TIER_LABEL.get(event.tier, event.tier.upper())
+    what = POSTURE_PHRASE.get(event.posture, f"posture: {event.posture}")
     caption = (
-        f"{label}: {event.posture} detected in {where}\n"
-        f"Resident {event.person_id} - risk {event.risk_score}/100, held {event.duration_s:.1f} s"
+        f"{label}: {event.person_id} {what}\n"
+        f"Location: {where}\n"
+        f"Duration: {event.duration_s:.1f} s"
     )
     return caption[:CAPTION_LIMIT]
 
 
 def format_message(event: ClassifiedEvent) -> str:
-    """Plain-text phone message for one classified event."""
-    reasons = "; ".join(event.reasons[:2])
-    return f"{format_caption(event)}\n{reasons}"
+    """Plain-text phone message, used when no photo can be sent. Same text as the caption."""
+    return format_caption(event)
 
 
 def telegram_sender(token: str, chat_id: str, timeout_s: float = 5.0) -> SendFn:
