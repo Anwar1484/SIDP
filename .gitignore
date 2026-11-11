@@ -54,3 +54,6 @@ assets/audio/
 *_openvino_model/
 models/relateanything/
 models/fall-risk/
+
+# Local CCTV incident snapshots (resident imagery - never commit)
+captures/

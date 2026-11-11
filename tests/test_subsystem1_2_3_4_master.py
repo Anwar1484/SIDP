@@ -254,6 +254,105 @@ def test_icd03_http_server_endpoints(tmp_path: Path) -> None:
         bridge.shutdown()
 
 
+def test_archiver_strict_cooldown_and_on_saved_callback(tmp_path: Path) -> None:
+    from subsystem1_2_3_4_master import IncidentSnapshotArchiver
+
+    saved: list[dict] = []
+    archiver = IncidentSnapshotArchiver(captures_root=tmp_path / "captures", cooldown_seconds=15.0, on_saved=saved.append)
+    try:
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        warn = _dummy_person(track_id=3, posture=PostureClass.BENDING, tier=SafetyTier.WARNING, torso_angle=52.0)
+        unsafe = _dummy_person(track_id=3, posture=PostureClass.BENDING, tier=SafetyTier.UNSAFE, torso_angle=66.0)
+
+        assert archiver.maybe_archive(warn, frame, now_perf=100.0) is not None   # first entry -> immediate
+        assert archiver.maybe_archive(unsafe, frame, now_perf=101.0) is not None  # new (resident, state)
+        assert archiver.maybe_archive(warn, frame, now_perf=102.0) is None        # flicker back inside 15 s -> suppressed
+        assert archiver.maybe_archive(warn, frame, now_perf=116.0) is not None    # cooldown elapsed
+        archiver.flush()
+
+        assert len(saved) == 3
+        assert saved[0]["tier"] == "warning" and saved[1]["tier"] == "unsafe"
+        assert saved[0]["resident_id"] == 3 and saved[0]["torso_angle"] == 52.0
+        for meta in saved:
+            assert Path(meta["snapshot_path"]).is_file()
+    finally:
+        archiver.shutdown()
+
+
+def test_telemetry_dispatcher_telegram_photo_and_firebase_payloads(tmp_path: Path, monkeypatch) -> None:
+    import subsystem1_2_3_4_master as m
+
+    calls: list[dict] = []
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _Resp()
+
+    monkeypatch.setattr(m.requests, "post", fake_post)
+
+    jpg = tmp_path / "10-11-12_resident_1.jpg"
+    ok, buf = m.cv2.imencode(".jpg", np.zeros((60, 80, 3), dtype=np.uint8))
+    assert ok
+    jpg.write_bytes(buf.tobytes())
+
+    disp = m.TelemetryDispatcher(
+        telegram_token="123:TESTTOKEN",
+        telegram_chat_id="-100200",
+        firebase_url="https://example-rtdb.firebasedatabase.app/",
+        firebase_auth="",
+        resident_lookup=lambda rid: {"full_name": "Tok Mat", "room_number": "101"},
+    )
+    try:
+        meta = {
+            "timestamp": "2026-11-11 10:11:12",
+            "resident_id": 1,
+            "tier": "unsafe",
+            "posture": "Bending",
+            "torso_angle": 64.5,
+            "snapshot_path": str(jpg),
+        }
+        result = disp.dispatch_now(meta)
+        assert result["telegram"] == 200
+        photo_call = calls[0]
+        assert photo_call["url"].endswith("/bot123:TESTTOKEN/sendPhoto")
+        assert photo_call["data"]["chat_id"] == "-100200"
+        assert "[SIDP SAFETY ALERT]" in photo_call["data"]["caption"]
+        assert "Severity: UNSAFE" in photo_call["data"]["caption"]
+        assert "photo" in photo_call["files"]
+
+        incidents = next(c for c in calls if c["url"].endswith("/incidents.json"))
+        assert incidents["url"] == "https://example-rtdb.firebasedatabase.app/incidents.json"
+        assert incidents["json"] == {
+            "timestamp": "2026-11-11 10:11:12",
+            "resident_id": 1,
+            "resident_name": "Tok Mat",
+            "room_number": "101",
+            "posture": "Bending",
+            "torso_angle": 64.5,
+            "severity": "Unsafe",
+            "snapshot_path": str(jpg),
+        }
+        logs = next(c for c in calls if c["url"].endswith("/ACTIVITY_LOGS.json"))
+        assert logs["json"]["resident_id"] == "res_001" and logs["json"]["angle_degrees"] == 64.5
+
+        # Warning tier: Firebase only (Telegram skipped unless explicitly enabled)
+        calls.clear()
+        warn_result = disp.dispatch_now({**meta, "tier": "warning"})
+        assert "telegram" not in warn_result
+        assert all("telegram.org" not in c["url"] for c in calls)
+
+        # Missing image -> falls back to sendMessage
+        calls.clear()
+        disp.dispatch_now({**meta, "snapshot_path": str(tmp_path / "missing.jpg")})
+        assert calls[0]["url"].endswith("/sendMessage")
+    finally:
+        disp.shutdown(drain_timeout=0.5)
+
+
 def test_master_1234_s2_s3_payload_interface(tmp_path: Path) -> None:
     from subsystem1_2_3_4_master import Subsystem3SafetyEngine
 

@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -1310,6 +1310,242 @@ class NonBlockingAlertDispatcher:
             self._telegram_thread.join(timeout=1.5)
 
 
+DEFAULT_FIREBASE_DATABASE_URL = (
+    "https://elderly-monitoring-syste-25f10-default-rtdb.asia-southeast1.firebasedatabase.app"
+)
+DEFAULT_FIREBASE_PROJECT_ID = "elderly-monitoring-syste-25f10"
+
+
+class TelemetryDispatcher:
+    """
+    Method A (Local Snapshot + Cloud Telemetry) dispatcher, fully non-blocking.
+
+    After `IncidentSnapshotArchiver` has written `captures/YYYY-MM-DD/<tier>/...jpg`
+    to local disk, it calls `enqueue_incident(meta)`. A daemon thread then:
+      1. Telegram group: `sendPhoto` (multipart, image read from local disk) with a
+         caption; falls back to `sendMessage` if the file/upload is unavailable.
+         Only for tiers in `telegram_tiers` (default: unsafe, alert).
+      2. Firebase Realtime Database (REST):
+           - POST `/incidents.json`      -> flat incident record (Method A schema)
+           - POST `/ACTIVITY_LOGS.json`  -> record shaped like the node the
+             Subsystem 4 dashboard (`posture-dashboard.js`) already listens to.
+    Credentials come from the environment (`.env`), never from source code:
+      TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FIREBASE_DATABASE_URL,
+      FIREBASE_AUTH_TOKEN (optional; needed only if the RTDB rules require auth).
+    """
+
+    def __init__(
+        self,
+        telegram_token: Optional[str] = None,
+        telegram_chat_id: Optional[str] = None,
+        firebase_url: Optional[str] = None,
+        firebase_auth: Optional[str] = None,
+        telegram_enabled: bool = True,
+        firebase_enabled: bool = True,
+        telegram_include_warning: bool = False,
+        resident_lookup: Optional[Callable[[int], Optional[dict[str, Any]]]] = None,
+        timeout_s: float = 8.0,
+    ) -> None:
+        self.telegram_token = (telegram_token if telegram_token is not None else os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+        self.telegram_chat_id = (telegram_chat_id if telegram_chat_id is not None else os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+        self.firebase_url = (
+            (firebase_url if firebase_url is not None else os.getenv("FIREBASE_DATABASE_URL", DEFAULT_FIREBASE_DATABASE_URL))
+            .strip()
+            .rstrip("/")
+        )
+        self.firebase_auth = (firebase_auth if firebase_auth is not None else os.getenv("FIREBASE_AUTH_TOKEN", "")).strip()
+        self.telegram_active = bool(telegram_enabled and self.telegram_token and self.telegram_chat_id)
+        self.firebase_active = bool(firebase_enabled and self.firebase_url)
+        self.telegram_tiers = {"unsafe", "alert"} | ({"warning"} if telegram_include_warning else set())
+        self.resident_lookup = resident_lookup
+        self.timeout_s = float(timeout_s)
+
+        self.last_results: deque[dict[str, Any]] = deque(maxlen=50)
+        self._warned: set[str] = set()
+        self._queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=64)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._worker, name="SIDP-Telemetry-Dispatcher", daemon=True)
+        self._thread.start()
+        logger.info(
+            "TelemetryDispatcher ready (telegram=%s tiers=%s, firebase=%s%s)",
+            "ON" if self.telegram_active else "OFF (no token/chat id)",
+            sorted(self.telegram_tiers),
+            "ON" if self.firebase_active else "OFF",
+            " [auth token set]" if self.firebase_auth else "",
+        )
+
+    # ---- helpers -----------------------------------------------------------------
+    def _scrub(self, text: str) -> str:
+        """Never let the bot token leak into logs (it is embedded in the Telegram URL)."""
+        return text.replace(self.telegram_token, "<TELEGRAM_BOT_TOKEN>") if self.telegram_token else text
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.warning("%s", self._scrub(message))
+
+    @staticmethod
+    def build_caption(meta: dict[str, Any]) -> str:
+        angle = meta.get("torso_angle")
+        angle_txt = f" ({angle}°)" if angle is not None else ""
+        return (
+            "🚨 [SIDP SAFETY ALERT]\n"
+            f"Resident ID: {meta.get('resident_id')}\n"
+            f"Severity: {str(meta.get('tier', '')).upper()}\n"
+            f"Posture: {meta.get('posture')}{angle_txt}\n"
+            f"Time: {meta.get('timestamp')}\n"
+            f"File: {meta.get('snapshot_path')}"
+        )
+
+    def build_firebase_record(self, meta: dict[str, Any]) -> dict[str, Any]:
+        profile: dict[str, Any] = {}
+        if self.resident_lookup is not None:
+            try:
+                profile = self.resident_lookup(int(meta["resident_id"])) or {}
+            except Exception:
+                profile = {}
+        return {
+            "timestamp": meta.get("timestamp"),
+            "resident_id": meta.get("resident_id"),
+            "resident_name": profile.get("full_name", f"Resident #{meta.get('resident_id')}"),
+            "room_number": str(profile.get("room_number", "")),
+            "posture": meta.get("posture"),
+            "torso_angle": meta.get("torso_angle"),
+            "severity": str(meta.get("tier", "")).title(),
+            "snapshot_path": meta.get("snapshot_path"),
+        }
+
+    @staticmethod
+    def build_activity_log_record(meta: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+        """Shape expected by the dashboard's `ACTIVITY_LOGS/{logId}` listeners."""
+        posture = str(meta.get("posture", "")).lower()
+        return {
+            "resident_id": f"res_{int(meta.get('resident_id', 0)):03d}",
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "event_type": f"{record['severity']} posture: {meta.get('posture')}",
+            "activity_recognition": posture.replace(" down", ""),
+            "pose_status": f"{record['severity']}: {meta.get('posture')}",
+            "angle_degrees": meta.get("torso_angle") if meta.get("torso_angle") is not None else 0,
+            "fall_detected": posture == "falling",
+            "inactivity_detected": posture == "lying down",
+            "snapshot_local_path": meta.get("snapshot_path"),
+        }
+
+    # ---- network operations (run on the worker thread only) ----------------------
+    def send_telegram(self, meta: dict[str, Any]) -> Optional[int]:
+        if not self.telegram_active:
+            return None
+        base = f"https://api.telegram.org/bot{self.telegram_token}"
+        caption = self.build_caption(meta)
+        photo_path = Path(str(meta.get("snapshot_path", "")))
+        try:
+            if photo_path.is_file():
+                with open(photo_path, "rb") as fh:
+                    resp = requests.post(
+                        f"{base}/sendPhoto",
+                        data={"chat_id": self.telegram_chat_id, "caption": caption},
+                        files={"photo": (photo_path.name, fh, "image/jpeg")},
+                        timeout=self.timeout_s,
+                    )
+                if resp.status_code == 200:
+                    return resp.status_code
+                self._warn_once("tg_photo", f"Telegram sendPhoto HTTP {resp.status_code}: {resp.text[:160]} (falling back to text)")
+            resp = requests.post(
+                f"{base}/sendMessage",
+                json={"chat_id": self.telegram_chat_id, "text": caption},
+                timeout=self.timeout_s,
+            )
+            if resp.status_code != 200:
+                self._warn_once("tg_text", f"Telegram sendMessage HTTP {resp.status_code}: {resp.text[:160]}")
+            return resp.status_code
+        except Exception as exc:
+            self._warn_once("tg_exc", f"Telegram dispatch failed: {exc}")
+            return None
+
+    def _firebase_post(self, node: str, payload: dict[str, Any]) -> Optional[int]:
+        params = {"auth": self.firebase_auth} if self.firebase_auth else None
+        try:
+            resp = requests.post(
+                f"{self.firebase_url}/{node}.json",
+                json=payload,
+                params=params,
+                timeout=self.timeout_s,
+            )
+            if resp.status_code in (401, 403):
+                self._warn_once(
+                    f"fb_{resp.status_code}_{node}",
+                    f"Firebase /{node}.json -> HTTP {resp.status_code} (Permission denied). The RTDB rules require "
+                    "authentication; set FIREBASE_AUTH_TOKEN in .env or adjust rules via the Firebase Console.",
+                )
+            elif resp.status_code != 200:
+                self._warn_once(f"fb_{resp.status_code}_{node}", f"Firebase /{node}.json -> HTTP {resp.status_code}: {resp.text[:160]}")
+            return resp.status_code
+        except Exception as exc:
+            self._warn_once("fb_exc", f"Firebase dispatch failed: {exc}")
+            return None
+
+    def send_firebase(self, meta: dict[str, Any]) -> dict[str, Optional[int]]:
+        if not self.firebase_active:
+            return {}
+        record = self.build_firebase_record(meta)
+        return {
+            "incidents": self._firebase_post("incidents", record),
+            "ACTIVITY_LOGS": self._firebase_post("ACTIVITY_LOGS", self.build_activity_log_record(meta, record)),
+        }
+
+    def dispatch_now(self, meta: dict[str, Any]) -> dict[str, Any]:
+        """Synchronous dispatch (used by the worker and by `test_telegram_firebase.py`)."""
+        result: dict[str, Any] = {"snapshot_path": meta.get("snapshot_path"), "tier": meta.get("tier")}
+        if str(meta.get("tier", "")).lower() in self.telegram_tiers:
+            result["telegram"] = self.send_telegram(meta)
+        result["firebase"] = self.send_firebase(meta)
+        self.last_results.append(result)
+        return result
+
+    # ---- queue plumbing ----------------------------------------------------------
+    def enqueue_incident(self, meta: dict[str, Any]) -> bool:
+        if self._stop_event.is_set() or not (self.telegram_active or self.firebase_active):
+            return False
+        try:
+            self._queue.put_nowait(dict(meta))
+            return True
+        except queue.Full:
+            return False
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                result = self.dispatch_now(item)
+                logger.info(
+                    "Telemetry dispatched | tier=%s telegram=%s firebase=%s",
+                    result.get("tier"),
+                    result.get("telegram", "skipped"),
+                    result.get("firebase"),
+                )
+            except Exception as exc:
+                logger.warning("TelemetryDispatcher worker error: %s", self._scrub(str(exc)))
+            finally:
+                self._queue.task_done()
+
+    def flush(self, timeout: float = 8.0) -> None:
+        deadline = time.time() + timeout
+        while self._queue.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.05)
+
+    def shutdown(self, drain_timeout: float = 6.0) -> None:
+        self.flush(drain_timeout)
+        self._stop_event.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+
+
 class IncidentSnapshotArchiver:
     """
     Automated CCTV Incident Snapshot & Date-Partitioned Directory Archiver
@@ -1337,14 +1573,18 @@ class IncidentSnapshotArchiver:
         captures_root: Path = CAPTURES_DIR,
         cooldown_seconds: float = 15.0,
         jpeg_quality: int = 90,
+        on_saved: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
         self.captures_root = Path(captures_root)
         self.cooldown_seconds = float(cooldown_seconds)
         self.jpeg_quality = int(jpeg_quality)
+        # Invoked from the writer thread AFTER the JPEG is on disk; used by
+        # `TelemetryDispatcher` (Telegram + Firebase) so uploads read the local file.
+        self.on_saved = on_saved
 
         self._last_tier: dict[str, SafetyTier] = {}
         self._last_capture_ts: dict[tuple[str, SafetyTier], float] = {}
-        self._write_queue: queue.Queue[Optional[tuple[Path, np.ndarray]]] = queue.Queue(maxsize=64)
+        self._write_queue: queue.Queue[Optional[tuple[Path, np.ndarray, dict[str, Any]]]] = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._writer_loop,
@@ -1447,23 +1687,36 @@ class IncidentSnapshotArchiver:
             return None
 
         now_ts = time.perf_counter() if now_perf is None else now_perf
-        prev_tier = self._last_tier.get(person_id, SafetyTier.SAFE)
-        tier_changed = (tier != prev_tier)
+        # Strict per-(resident, state) cooldown: the first entry into a state fires
+        # immediately (no previous timestamp); repeats wait `cooldown_seconds`.
         last_ts = self._last_capture_ts.get((person_id, tier), -float("inf"))
-        cooldown_elapsed = (now_ts - last_ts) >= self.cooldown_seconds
-
-        if not (tier_changed or cooldown_elapsed):
+        if (now_ts - last_ts) < self.cooldown_seconds:
             return None
 
         self._last_tier[person_id] = tier
         self._last_capture_ts[(person_id, tier)] = now_ts
 
-        target_path = self.build_snapshot_path(tier, telemetry.track_id, dt=dt)
+        now_dt = dt if dt is not None else datetime.now()
+        target_path = self.build_snapshot_path(tier, telemetry.track_id, dt=now_dt)
         img_to_save = (
-            self.render_incident_frame(frame, telemetry, dt=dt)
+            self.render_incident_frame(frame, telemetry, dt=now_dt)
             if annotate or frame is None
             else frame.copy()
         )
+        meta: dict[str, Any] = {
+            "timestamp": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "resident_id": int(telemetry.track_id),
+            "person_id": str(person_id),
+            "tier": tier.value,
+            "posture": telemetry.posture.value,
+            "torso_angle": (
+                round(float(telemetry.torso_angle_deg), 1)
+                if telemetry.torso_angle_deg is not None
+                else None
+            ),
+            "risk_score": int(telemetry.risk_score),
+            "snapshot_path": target_path.as_posix(),
+        }
 
         if self._write_queue.full():
             try:
@@ -1472,7 +1725,7 @@ class IncidentSnapshotArchiver:
             except queue.Empty:
                 pass
         try:
-            self._write_queue.put_nowait((target_path, img_to_save))
+            self._write_queue.put_nowait((target_path, img_to_save, meta))
         except queue.Full:
             pass
 
@@ -1490,14 +1743,19 @@ class IncidentSnapshotArchiver:
                 self._write_queue.task_done()
                 break
 
-            target_path, img = item
+            target_path, img, meta = item
             try:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+                os.makedirs(target_path.parent, exist_ok=True)
                 ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
                 if ok:
                     tmp_path = target_path.with_suffix(".jpg.tmp")
                     tmp_path.write_bytes(buf.tobytes())
                     os.replace(str(tmp_path), str(target_path))
+                    if self.on_saved is not None:
+                        try:
+                            self.on_saved(meta)
+                        except Exception as cb_exc:
+                            logger.warning("Incident on_saved callback error: %s", cb_exc)
             except Exception as exc:
                 logger.warning("IncidentSnapshotArchiver write error (%s): %s", target_path, exc)
             finally:
@@ -2228,6 +2486,23 @@ class ICD03DataBridge:
                     }
 
         self._write_live_state_json()
+
+    def get_resident_profile(self, track_id: int) -> Optional[dict[str, Any]]:
+        """Resident profile (`full_name`, `room_number`, ...) for a tracked person, if registered."""
+        with self._state_lock:
+            prof = self._residents.get(f"res_{int(track_id):03d}")
+            return dict(prof) if prof else None
+
+    def attach_snapshot_archiver(self, archiver: "IncidentSnapshotArchiver") -> None:
+        """
+        Share Subsystem 3's archiver so the bridge and the safety engine use ONE
+        per-(resident, state) cooldown and never save duplicate incident snapshots.
+        """
+        old = self.snapshot_archiver
+        self.snapshot_archiver = archiver
+        self.captures_dir = archiver.captures_root
+        if old is not archiver:
+            old.shutdown()
 
     def track_id_to_resident_id(self, track_id: int) -> str:
         """
@@ -3431,6 +3706,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--open-browser", action="store_true", help="Automatically open the Caregiver Web Dashboard in default browser")
     parser.add_argument("--no-ptz", action="store_true", help="Disable ONVIF PTZ motor initialization")
     parser.add_argument("--no-audio", action="store_true", help="Disable pyttsx3 voice alert synthesis")
+    parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram group alerts")
+    parser.add_argument("--no-firebase", action="store_true", help="Disable Firebase Realtime Database telemetry")
+    parser.add_argument("--telegram-warning", action="store_true", help="Also send Telegram alerts for the Warning tier")
     parser.add_argument("--headless", action="store_true", help="Run without OpenCV GUI window")
     parser.add_argument("--max-frames", type=int, default=None, help="Bounded frame count for smoke tests")
     return parser.parse_args(argv)
@@ -3460,14 +3738,26 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception:
                 pass
 
-    # 2. Initialize Subsystem 3 Safety Decision Engine & Non-Blocking Alert Threads
+    # 2. Initialize Subsystem 3 Safety Decision Engine & Non-Blocking Alert Threads.
+    #    Telegram is delivered by `TelemetryDispatcher` (photo read from the local
+    #    `captures/` file), so the engine's legacy Telegram path is disabled to avoid duplicates.
     safety_engine = Subsystem3SafetyEngine(
         camera_id="tapo_c210" if not args.webcam else f"webcam_{args.camera_index}",
         zone_name=args.zone,
         audio_enabled=(not args.no_audio),
-        telegram_enabled=True,
+        telegram_enabled=False,
         cooldown_seconds=args.cooldown,
     )
+
+    # 2b. Method A: local date-folder snapshots (captures/) + Telegram group + Firebase RTDB
+    telemetry_dispatcher = TelemetryDispatcher(
+        telegram_enabled=(not args.no_telegram),
+        firebase_enabled=(not args.no_firebase),
+        telegram_include_warning=args.telegram_warning,
+        resident_lookup=icd03_bridge.get_resident_profile,
+    )
+    safety_engine.snapshot_archiver.on_saved = telemetry_dispatcher.enqueue_incident
+    icd03_bridge.attach_snapshot_archiver(safety_engine.snapshot_archiver)
 
     # 3. Initialize Subsystem 2 Vision Analytics Pipeline
     pipeline = UnifiedVisionSafetyPipeline(
@@ -3606,6 +3896,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         stream.stop()
         ptz.shutdown()
         safety_engine.shutdown()
+        telemetry_dispatcher.shutdown()
         if http_dashboard is not None:
             http_dashboard.stop()
         if streamlit_dashboard is not None:
