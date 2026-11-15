@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import functools
 import http.server
+import importlib
 import json
 import logging
 import math
@@ -54,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import cv2
+import joblib
 import numpy as np
 import requests
 from dotenv import load_dotenv
@@ -70,13 +72,14 @@ SUBSYSTEM4_WEB_ROOT = SUBSYSTEM4_ROOT / "elderly_monitoring_system"
 OUTPUTS_DIR = WORKSPACE_ROOT / "outputs"
 SNAPSHOTS_DIR = OUTPUTS_DIR / "snapshots"
 CAPTURES_DIR = WORKSPACE_ROOT / "captures"
+TRAINED_POSTURE_MODEL_PATH = WORKSPACE_ROOT / "trained_posture_model.pkl"
 
 for _p in (WORKSPACE_ROOT, SUBSYSTEM3_SRC):
     if _p.exists() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 # Import Subsystem 3 core modules from ./Subsystem3-Safety-Engine/src/alert_engine
-from alert_engine.activity import (  # noqa: E402
+from alert_engine.activity import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     UNMONITORED,
     ActivityPeriod,
     ActivitySummary,
@@ -84,20 +87,19 @@ from alert_engine.activity import (  # noqa: E402
     load_rows,
     summarise,
 )
-from alert_engine.config import Config as S3Config, load_config as load_s3_config  # noqa: E402
-from alert_engine.debounce import DebounceTracker  # noqa: E402
-from alert_engine.frames import FolderFrameSource, FrameSource  # noqa: E402
-from alert_engine.ml_scoring import HybridScorer  # noqa: E402
-from alert_engine.notifier import (  # noqa: E402
-    Notifier,
+from alert_engine.config import Config as S3Config, load_config as load_s3_config  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.debounce import DebounceTracker  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.frames import FolderFrameSource, FrameSource  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.ml_scoring import HybridScorer  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.notifier import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     format_caption,
     format_message,
     telegram_photo_sender,
     telegram_sender,
 )
-from alert_engine.schemas import ClassifiedEvent, PostureEventIn  # noqa: E402
-from alert_engine.scoring import ScoreResult, score_posture  # noqa: E402
-from alert_engine.sinks import LocalSqliteSink  # noqa: E402
+from alert_engine.schemas import ClassifiedEvent, PostureEventIn  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.scoring import ScoreResult  # noqa: E402  # pyright: ignore[reportMissingImports]
+from alert_engine.sinks import LocalSqliteSink  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,13 +150,14 @@ COCO_SKELETON_EDGES: tuple[tuple[int, int], ...] = (
 
 
 class PostureClass(str, Enum):
-    """Subsystem 2 6-Class Posture Taxonomy."""
+    """Subsystem 2 Posture Taxonomy (4 AI Postures + Fall + Insufficient Evidence)."""
     STANDING = "STANDING"
     SITTING = "SITTING"
     WALKING = "WALKING"
     BENDING = "BENDING"
     FALLING = "FALLING"
     LYING_DOWN = "LYING DOWN"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT EVIDENCE"
 
     @property
     def s3_name(self) -> str:
@@ -166,6 +169,7 @@ class PostureClass(str, Enum):
             PostureClass.BENDING: "bending",
             PostureClass.FALLING: "fall",
             PostureClass.LYING_DOWN: "lying",
+            PostureClass.INSUFFICIENT_EVIDENCE: "unknown",
         }[self]
 
     @property
@@ -178,6 +182,7 @@ class PostureClass(str, Enum):
             PostureClass.BENDING: "bending",
             PostureClass.FALLING: "lying",
             PostureClass.LYING_DOWN: "lying",
+            PostureClass.INSUFFICIENT_EVIDENCE: "unknown",
         }[self]
 
 
@@ -769,6 +774,8 @@ class TrackHistoryState:
     track_id: int
     samples: deque[FrameKinematicsSample] = field(default_factory=lambda: deque(maxlen=30))
     posture_votes: deque[PostureClass] = field(default_factory=lambda: deque(maxlen=5))
+    prev_norm_kpts: Optional[np.ndarray] = None
+    prediction_history: deque[str] = field(default_factory=lambda: deque(maxlen=5))
     fall_latched_until: float = 0.0
     reference_height_px: float = 280.0
     last_seen_ts: float = 0.0
@@ -787,6 +794,8 @@ class PersonTelemetry:
     knee_angle_deg: Optional[float]
     vertical_velocity_mps: float
     rgb_fall_conf: Optional[float]
+    whole_body_visible: bool = True
+    ai_confidence: Optional[float] = None
     # Subsystem 3 fields populated by Subsystem3SafetyEngine
     safety_tier: SafetyTier = SafetyTier.SAFE
     risk_score: int = 0
@@ -806,7 +815,11 @@ class PersonTelemetry:
         return {
             "bbox": [float(v) for v in self.bbox],
             "keypoints": [[float(pt[0]), float(pt[1]), float(pt[2])] for pt in self.keypoints_xyc],
-            "posture": self.posture.s3_name,
+            "posture": (
+                "insufficient_evidence"
+                if (not self.whole_body_visible or self.posture == PostureClass.INSUFFICIENT_EVIDENCE)
+                else self.posture.s3_name
+            ),
             "posture_class": self.posture.value,
             "confidence": float(self.confidence),
             "track_id": int(self.track_id),
@@ -814,7 +827,59 @@ class PersonTelemetry:
             "knee_angle_deg": float(self.knee_angle_deg) if self.knee_angle_deg is not None else None,
             "vertical_velocity_mps": float(self.vertical_velocity_mps),
             "rgb_fall_conf": float(self.rgb_fall_conf) if self.rgb_fall_conf is not None else None,
+            "whole_body_visible": bool(self.whole_body_visible),
+            "ai_confidence": float(self.ai_confidence) if self.ai_confidence is not None else None,
         }
+
+
+def is_whole_body_visible(
+    kpts_xyn: np.ndarray | list[list[float]],
+    kpts_conf: Optional[np.ndarray | list[float]] = None,
+    conf_thresh: float = 0.45,
+) -> bool:
+    """
+    Strict Whole-Body Visibility Gate for COCO 17 keypoints:
+      - Upper Body: Nose (0), Left Shoulder (5), Right Shoulder (6)
+      - Core / Torso: Left Hip (11), Right Hip (12)
+      - Lower Body / Legs: Left Knee (13), Right Knee (14), Left Ankle (15), Right Ankle (16)
+
+    Validation Rules:
+      1. Both shoulders (5, 6) and both hips (11, 12) must have valid normalized
+         coordinates (0.02 < x < 0.98) and (0.02 < y < 0.98).
+      2. At least one knee (13 or 14) AND at least one ankle (15 or 16) must be
+         detected inside the frame boundaries (0.02 < x < 0.98, 0.02 < y < 0.98).
+      3. If keypoint confidence scores (`kpts_conf`) are available, require
+         confidence >= `conf_thresh` (0.45) for shoulders, hips, knees, and ankles.
+    """
+    if kpts_xyn is None:
+        return False
+    arr = np.asarray(kpts_xyn, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] < 17 or arr.shape[1] < 2:
+        return False
+
+    conf_arr: Optional[np.ndarray] = None
+    if kpts_conf is not None:
+        conf_arr = np.asarray(kpts_conf, dtype=np.float32).flatten()
+    elif arr.shape[1] >= 3:
+        conf_arr = arr[:, 2].flatten()
+
+    def _is_valid_point(idx: int) -> bool:
+        x = float(arr[idx, 0])
+        y = float(arr[idx, 1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return False
+        if not (0.02 < x < 0.98 and 0.02 < y < 0.98):
+            return False
+        if conf_arr is not None and len(conf_arr) > idx:
+            if float(conf_arr[idx]) < conf_thresh:
+                return False
+        return True
+
+    shoulders_ok = _is_valid_point(KP_L_SHOULDER) and _is_valid_point(KP_R_SHOULDER)
+    hips_ok = _is_valid_point(KP_L_HIP) and _is_valid_point(KP_R_HIP)
+    knees_ok = _is_valid_point(KP_L_KNEE) or _is_valid_point(KP_R_KNEE)
+    ankles_ok = _is_valid_point(KP_L_ANKLE) or _is_valid_point(KP_R_ANKLE)
+    return bool(shoulders_ok and hips_ok and knees_ok and ankles_ok)
 
 
 def compute_joint_angle_deg(
@@ -836,8 +901,13 @@ def compute_joint_angle_deg(
 
 class SixClassPostureEngine:
     """
-    Deterministic geometric and temporal posture analysis using 17 COCO keypoints:
-      - STANDING, SITTING, WALKING, BENDING, FALLING, LYING DOWN.
+    Subsystem 2 Posture & Kinematic Classifier:
+      - Enforces the strict Whole-Body Visibility Gate (`is_whole_body_visible`).
+      - Uses the retrained 4-class AI posture model (`trained_posture_model.pkl`:
+        `standing`, `sitting`, `bending`, `lying_down`) as the primary posture
+        classifier with per-person velocity features and 5-frame rolling smoothing.
+      - Retains kinematic/RGB emergency `FALLING` detection and geometric angle
+        telemetry (`torso_angle_deg`, `knee_angle_deg`).
     """
 
     STANDING_MAX_TORSO_DEG: float = 25.0
@@ -853,9 +923,33 @@ class SixClassPostureEngine:
     FALL_LATCH_DURATION_SEC: float = 0.9
     ASSUMED_HUMAN_HEIGHT_M: float = 1.65
 
-    def __init__(self, kp_conf_threshold: float = 0.30) -> None:
+    AI_LABEL_TO_POSTURE: dict[str, PostureClass] = {
+        "standing": PostureClass.STANDING,
+        "sitting": PostureClass.SITTING,
+        "bending": PostureClass.BENDING,
+        "lying_down": PostureClass.LYING_DOWN,
+        "lying": PostureClass.LYING_DOWN,
+    }
+
+    def __init__(
+        self,
+        kp_conf_threshold: float = 0.30,
+        whole_body_conf_threshold: float = 0.45,
+        model_path: Optional[Path] = None,
+    ) -> None:
         self.kp_conf_threshold = kp_conf_threshold
+        self.whole_body_conf_threshold = whole_body_conf_threshold
         self.tracks: dict[int, TrackHistoryState] = {}
+
+        resolved_model = Path(model_path) if model_path is not None else TRAINED_POSTURE_MODEL_PATH
+        self.ai_classifier: Any = None
+        if resolved_model.is_file():
+            try:
+                self.ai_classifier = joblib.load(resolved_model)
+                logger.info("Loaded 4-class trained AI posture model: %s", resolved_model)
+            except Exception as exc:
+                logger.warning("Failed to load trained AI posture model (%s): %s", resolved_model, exc)
+                self.ai_classifier = None
 
     def prune_stale_tracks(self, current_ts: float, max_stale_sec: float = 2.0) -> list[int]:
         stale = [
@@ -889,6 +983,7 @@ class SixClassPostureEngine:
         frame_height: int,
         rgb_fall_confidence: Optional[float] = None,
         camera_moving: bool = False,
+        frame_width: int = 640,
     ) -> PersonTelemetry:
         state = self.tracks.get(track_id)
         if state is None:
@@ -934,6 +1029,40 @@ class SixClassPostureEngine:
         ]
         min_knee_angle = min(knee_angles) if knee_angles else None
         max_knee_angle = max(knee_angles) if knee_angles else None
+
+        # ------------------------------------------------------------------
+        # STAGE 2 & 4: Strict Whole-Body Visibility Gate
+        # ------------------------------------------------------------------
+        fw = float(max(1, frame_width))
+        fh = float(max(1, frame_height))
+        kpts_xyn = np.column_stack(
+            (keypoints_xyc[:, 0] / fw, keypoints_xyc[:, 1] / fh)
+        ).astype(np.float32)
+        kpts_conf = keypoints_xyc[:, 2].astype(np.float32)
+
+        whole_body_ok = is_whole_body_visible(
+            kpts_xyn,
+            kpts_conf=kpts_conf,
+            conf_thresh=self.whole_body_conf_threshold,
+        )
+        if not whole_body_ok:
+            state.prev_norm_kpts = None
+            state.prediction_history.clear()
+            state.posture_votes.clear()
+            return PersonTelemetry(
+                track_id=track_id,
+                person_id=f"p-{track_id:03d}",
+                bbox=bbox,
+                confidence=det_conf,
+                keypoints_xyc=keypoints_xyc,
+                posture=PostureClass.INSUFFICIENT_EVIDENCE,
+                torso_angle_deg=torso_angle,
+                knee_angle_deg=min_knee_angle,
+                vertical_velocity_mps=0.0,
+                rgb_fall_conf=rgb_fall_confidence,
+                whole_body_visible=False,
+                ai_confidence=None,
+            )
 
         thigh_vertical_dist: Optional[float] = None
         if mid_hip is not None and mid_knee is not None:
@@ -1081,11 +1210,52 @@ class SixClassPostureEngine:
             )
         )
 
+        # ------------------------------------------------------------------
+        # STAGE 4: Primary 4-Class AI Posture Classifier (`trained_posture_model.pkl`)
+        # ------------------------------------------------------------------
+        ai_conf: Optional[float] = None
+        ai_posture: Optional[PostureClass] = None
+        if self.ai_classifier is not None:
+            try:
+                mid_hip_xyn = (kpts_xyn[KP_L_HIP] + kpts_xyn[KP_R_HIP]) / 2.0
+                centered_xyn = kpts_xyn - mid_hip_xyn
+                mid_shoulder_xyn = (kpts_xyn[KP_L_SHOULDER] + kpts_xyn[KP_R_SHOULDER]) / 2.0
+                body_size = float(np.linalg.norm(mid_shoulder_xyn - mid_hip_xyn)) + 1e-6
+                norm_kpts = (centered_xyn / body_size).flatten().astype(np.float32)
+
+                if state.prev_norm_kpts is None:
+                    velocity = np.zeros(34, dtype=np.float32)
+                else:
+                    velocity = (norm_kpts - state.prev_norm_kpts).astype(np.float32)
+                state.prev_norm_kpts = norm_kpts.copy()
+
+                features = np.concatenate([norm_kpts, velocity]).reshape(1, -1)
+                pred_label = str(self.ai_classifier.predict(features)[0]).strip().lower()
+                if hasattr(self.ai_classifier, "predict_proba"):
+                    probs = self.ai_classifier.predict_proba(features)[0]
+                    ai_conf = float(np.max(probs)) * 100.0
+
+                state.prediction_history.append(pred_label)
+                smoothed_label = max(
+                    set(state.prediction_history),
+                    key=state.prediction_history.count,
+                )
+                ai_posture = self.AI_LABEL_TO_POSTURE.get(
+                    smoothed_label, PostureClass.STANDING
+                )
+            except Exception as exc:
+                logger.debug("AI posture inference fallback to geometric: %s", exc)
+                ai_posture = None
+
         state.posture_votes.append(raw_posture)
         if raw_posture == PostureClass.FALLING:
             final_posture = PostureClass.FALLING
+        elif ai_posture is not None:
+            final_posture = ai_posture
         else:
             final_posture = Counter(state.posture_votes).most_common(1)[0][0]
+            if final_posture == PostureClass.WALKING:
+                final_posture = PostureClass.STANDING
 
         return PersonTelemetry(
             track_id=track_id,
@@ -1098,6 +1268,8 @@ class SixClassPostureEngine:
             knee_angle_deg=min_knee_angle,
             vertical_velocity_mps=v_y_mps,
             rgb_fall_conf=rgb_fall_confidence,
+            whole_body_visible=True,
+            ai_confidence=ai_conf,
         )
 
 
@@ -1178,11 +1350,21 @@ class NonBlockingAlertDispatcher:
 
     def _play_attention_beep(self, tier: SafetyTier) -> None:
         try:
-            from alert_engine.audio import TONE_SAMPLERATE, _make_beep_tone
             import sounddevice as sd
 
-            tone = _make_beep_tone(tier.value, TONE_SAMPLERATE)
-            sd.play(tone, TONE_SAMPLERATE)
+            # Keep the attention tone self-contained: some installations of the
+            # safety engine do not include its optional ``audio`` module.
+            sample_rate = 44_100
+            frequency, duration = {
+                SafetyTier.WARNING: (660.0, 0.18),
+                SafetyTier.UNSAFE: (880.0, 0.24),
+                SafetyTier.ALERT: (1_100.0, 0.32),
+            }.get(tier, (440.0, 0.14))
+            sample_count = int(sample_rate * duration)
+            samples = np.arange(sample_count, dtype=np.float32) / sample_rate
+            envelope = np.minimum(samples / 0.01, (duration - samples) / 0.02).clip(0.0, 1.0)
+            tone = (0.25 * envelope * np.sin(2.0 * np.pi * frequency * samples)).astype(np.float32)
+            sd.play(tone, sample_rate)
             sd.wait()
         except Exception:
             pass
@@ -1928,6 +2110,9 @@ class Subsystem3SafetyEngine:
             "fall": PostureClass.FALLING,
             "lying down": PostureClass.LYING_DOWN,
             "lying": PostureClass.LYING_DOWN,
+            "insufficient evidence": PostureClass.INSUFFICIENT_EVIDENCE,
+            "whole body not detected": PostureClass.INSUFFICIENT_EVIDENCE,
+            "unknown": PostureClass.INSUFFICIENT_EVIDENCE,
         }
         return mapping.get(norm, PostureClass.STANDING)
 
@@ -1957,7 +2142,11 @@ class Subsystem3SafetyEngine:
             if kps_arr.shape != (17, 3):
                 kps_arr = np.zeros((17, 3), dtype=np.float32)
 
+            whole_body_visible = bool(data.get("whole_body_visible", True))
             posture_cls = self._parse_posture_class(str(data.get("posture", "standing")))
+            if not whole_body_visible:
+                posture_cls = PostureClass.INSUFFICIENT_EVIDENCE
+
             torso_angle = data.get("bend_angle_deg")
             if torso_angle is None:
                 torso_angle = self.compute_torso_angle_from_keypoints(kps_arr)
@@ -1979,6 +2168,8 @@ class Subsystem3SafetyEngine:
                 knee_angle_deg=float(data["knee_angle_deg"]) if data.get("knee_angle_deg") is not None else None,
                 vertical_velocity_mps=float(data.get("vertical_velocity_mps", 0.0)),
                 rgb_fall_conf=float(data["rgb_fall_conf"]) if data.get("rgb_fall_conf") is not None else None,
+                whole_body_visible=whole_body_visible,
+                ai_confidence=float(data["ai_confidence"]) if data.get("ai_confidence") is not None else None,
             )
             results.append(self.evaluate(telemetry, now_ts))
         return results
@@ -2024,7 +2215,6 @@ class Subsystem3SafetyEngine:
     def evaluate(self, telemetry: PersonTelemetry, now_perf: float) -> PersonTelemetry:
         now_utc = datetime.now(timezone.utc)
         person_id = telemetry.person_id
-        s3_posture = telemetry.posture.s3_name
 
         if telemetry.torso_angle_deg is None:
             telemetry.torso_angle_deg = self.compute_torso_angle_from_keypoints(telemetry.keypoints_xyc)
@@ -2037,6 +2227,29 @@ class Subsystem3SafetyEngine:
                 posture_since_ts=now_perf,
             )
             self.timers[person_id] = timer
+
+        # ------------------------------------------------------------------
+        # Whole-Body Visibility Gate -> Keep Safety State in SAFE
+        # ------------------------------------------------------------------
+        if (
+            not telemetry.whole_body_visible
+            or telemetry.posture == PostureClass.INSUFFICIENT_EVIDENCE
+        ):
+            telemetry.posture = PostureClass.INSUFFICIENT_EVIDENCE
+            telemetry.whole_body_visible = False
+            timer.active_posture = PostureClass.INSUFFICIENT_EVIDENCE
+            timer.posture_since_ts = now_perf
+            timer.severe_bend_since_ts = None
+            telemetry.safety_tier = SafetyTier.SAFE
+            telemetry.risk_score = 0
+            telemetry.posture_duration_s = 0.0
+            telemetry.severe_bend_duration_s = 0.0
+            telemetry.safety_reasons = [
+                "Whole body not visible (Insufficient Evidence)"
+            ]
+            return telemetry
+
+        s3_posture = telemetry.posture.s3_name
 
         if timer.active_posture != telemetry.posture:
             timer.active_posture = telemetry.posture
@@ -2109,10 +2322,10 @@ class Subsystem3SafetyEngine:
                     0,
                     f"Sustained bending >60° ({angle_val:.0f}°) for {max(severe_bend_duration_s, effective_duration_s):.1f}s (>=3.0s threshold)",
                 )
-            elif effective_duration_s >= self.BENDING_ESCALATION_SECONDS and risk_score >= 60:
+            elif effective_duration_s >= self.BENDING_ESCALATION_SECONDS:
                 tier = SafetyTier.UNSAFE
-                risk_score = max(risk_score, 62)
-                reasons.insert(0, f"Sustained bending ({angle_val:.0f}°) for {effective_duration_s:.1f}s")
+                risk_score = max(risk_score, 64)
+                reasons.insert(0, f"Sustained bending ({angle_val:.0f}°) for {effective_duration_s:.1f}s (>=3.0s threshold)")
             else:
                 tier = SafetyTier.WARNING
                 risk_score = int(clamp(max(risk_score, 38), 30, 59))
@@ -3534,6 +3747,7 @@ class UnifiedVisionSafetyPipeline:
                 frame_height=h,
                 rgb_fall_confidence=matched_fall_conf,
                 camera_moving=camera_moving,
+                frame_width=w,
             )
             s2_payload[telemetry.person_id] = telemetry.to_s2_payload_entry()
 
@@ -3574,6 +3788,10 @@ def render_master_hud(
     now_ts = time.perf_counter()
 
     any_alert = any(p.safety_tier == SafetyTier.ALERT for p in persons)
+    any_insufficient = any(
+        (not p.whole_body_visible or p.posture == PostureClass.INSUFFICIENT_EVIDENCE)
+        for p in persons
+    )
 
     if ai_overlay_enabled:
         if any_alert and (int(now_ts * 8.0) % 2 == 0):
@@ -3581,7 +3799,11 @@ def render_master_hud(
 
         for p in persons:
             x1, y1, x2, y2 = map(int, p.bbox)
-            badge_bg, badge_fg, _ = _tier_visual_style(p.safety_tier, now_ts)
+            is_partial = (not p.whole_body_visible) or (p.posture == PostureClass.INSUFFICIENT_EVIDENCE)
+            if is_partial:
+                badge_bg, badge_fg = (0, 165, 255), (10, 10, 10)  # Orange/Yellow BGR
+            else:
+                badge_bg, badge_fg, _ = _tier_visual_style(p.safety_tier, now_ts)
 
             for i_a, i_b in COCO_SKELETON_EDGES:
                 xa, ya, ca = p.keypoints_xyc[i_a]
@@ -3604,8 +3826,13 @@ def render_master_hud(
             cv2.rectangle(canvas, (x1, y1), (x2, y2), badge_bg, box_thick)
 
             angle_str = f"{p.torso_angle_deg:.0f}deg" if p.torso_angle_deg is not None else "N/A"
-            line_1 = f"res_{p.track_id:03d} [{p.safety_tier.badge_text}] {p.posture.value} | Risk:{p.risk_score}/100"
-            line_2 = f"Torso:{angle_str} | Hold:{p.posture_duration_s:.1f}s | Conf:{p.confidence:.0%}"
+            if is_partial:
+                line_1 = f"res_{p.track_id:03d} [SAFE] Whole Body Not Detected (Insufficient Evidence)"
+                line_2 = f"Torso:{angle_str} | Status: Full-body visibility required"
+            else:
+                ai_tag = f" ({p.ai_confidence:.0f}%)" if p.ai_confidence is not None else ""
+                line_1 = f"res_{p.track_id:03d} [{p.safety_tier.badge_text}] {p.posture.value}{ai_tag} | Risk:{p.risk_score}/100"
+                line_2 = f"Torso:{angle_str} | Hold:{p.posture_duration_s:.1f}s | Conf:{p.confidence:.0%}"
 
             lines = [line_1, line_2]
             if p.posture == PostureClass.BENDING and p.safety_tier in (SafetyTier.WARNING, SafetyTier.UNSAFE):
@@ -3620,7 +3847,8 @@ def render_master_hud(
             box_h = len(lines) * line_h + pad_y * 2
 
             bx1 = max(4, min(x1, w - box_w - 4))
-            by1 = max(66, y1 - box_h - 4) if (y1 - box_h - 4) >= 66 else min(h - box_h - 6, y2 + 4)
+            top_limit = 96 if any_insufficient else 66
+            by1 = max(top_limit, y1 - box_h - 4) if (y1 - box_h - 4) >= top_limit else min(h - box_h - 6, y2 + 4)
             bx2, by2 = bx1 + box_w, by1 + box_h
 
             cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (16, 16, 16), -1)
@@ -3631,6 +3859,19 @@ def render_master_hud(
                 ty = by1 + pad_y + 12 + idx * line_h
                 fg = badge_fg if idx == 0 else (240, 240, 240)
                 cv2.putText(canvas, text, (bx1 + pad_x, ty), font, 0.44, fg, 1, cv2.LINE_AA)
+
+        if any_insufficient:
+            cv2.rectangle(canvas, (0, 61), (w, 90), (0, 165, 255), -1)
+            cv2.putText(
+                canvas,
+                "VISIBILITY GATE: Whole Body Not Detected (Insufficient Evidence) - Full-body visibility required",
+                (12, 81),
+                font,
+                0.44,
+                (10, 10, 10),
+                2,
+                cv2.LINE_AA,
+            )
 
     if ptz.mode == CameraMode.AUTOMATIC and not ptz.patrolling:
         cx_f, cy_f = w // 2, h // 2

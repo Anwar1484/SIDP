@@ -386,3 +386,103 @@ def test_master_1234_s2_s3_payload_interface(tmp_path: Path) -> None:
         engine.shutdown()
 
 
+def test_whole_body_visibility_gate_and_4class_ai_posture_engine(tmp_path: Path) -> None:
+    from subsystem1_2_3_4_master import (
+        SixClassPostureEngine,
+        Subsystem3SafetyEngine,
+        is_whole_body_visible,
+    )
+
+    # 1. Whole body visible (shoulders 5,6 + hips 11,12 + knees 13,14 + ankles 15,16 inside [0.02, 0.98])
+    full_xyn = np.full((17, 2), 0.5, dtype=np.float32)
+    full_xyn[0] = [0.50, 0.15]   # nose
+    full_xyn[5] = [0.45, 0.28]   # left shoulder
+    full_xyn[6] = [0.55, 0.28]   # right shoulder
+    full_xyn[11] = [0.46, 0.52]  # left hip
+    full_xyn[12] = [0.54, 0.52]  # right hip
+    full_xyn[13] = [0.46, 0.72]  # left knee
+    full_xyn[14] = [0.54, 0.72]  # right knee
+    full_xyn[15] = [0.46, 0.90]  # left ankle
+    full_xyn[16] = [0.54, 0.90]  # right ankle
+    full_conf = np.full(17, 0.92, dtype=np.float32)
+
+    assert is_whole_body_visible(full_xyn, full_conf, conf_thresh=0.45) is True
+
+    # 2. Cut-off ankles (outside frame or (0, 0)) -> False
+    cutoff_ankles = full_xyn.copy()
+    cutoff_ankles[15] = [0.0, 0.0]
+    cutoff_ankles[16] = [0.50, 0.995]  # >= 0.98 boundary
+    assert is_whole_body_visible(cutoff_ankles, full_conf, conf_thresh=0.45) is False
+
+    # 3. Low confidence on hips (< 0.45) -> False
+    low_conf = full_conf.copy()
+    low_conf[11] = 0.20
+    assert is_whole_body_visible(full_xyn, low_conf, conf_thresh=0.45) is False
+
+    # 4. SixClassPostureEngine + Subsystem3SafetyEngine integration
+    posture_engine = SixClassPostureEngine()
+    assert posture_engine.ai_classifier is not None
+    assert set(posture_engine.ai_classifier.classes_) == {
+        "standing",
+        "sitting",
+        "bending",
+        "lying_down",
+    }
+
+    s3_engine = Subsystem3SafetyEngine(
+        camera_id="tapo_c210_gate",
+        zone_name="living room",
+        audio_enabled=False,
+        telegram_enabled=False,
+        captures_root=tmp_path / "captures",
+    )
+    try:
+        # Partial body (missing legs/ankles) -> INSUFFICIENT_EVIDENCE and SAFE tier
+        partial_xyc = np.zeros((17, 3), dtype=np.float32)
+        partial_xyc[5] = [280.0, 140.0, 0.95]
+        partial_xyc[6] = [340.0, 140.0, 0.95]
+        partial_xyc[11] = [290.0, 260.0, 0.95]
+        partial_xyc[12] = [330.0, 260.0, 0.95]
+        # Knees and ankles at (0,0,0) -> occluded
+        t_partial = posture_engine.evaluate_person(
+            track_id=1,
+            bbox=(250.0, 100.0, 370.0, 300.0),
+            det_conf=0.90,
+            keypoints_xyc=partial_xyc,
+            timestamp=10.0,
+            frame_height=480,
+            frame_width=640,
+        )
+        assert t_partial.whole_body_visible is False
+        assert t_partial.posture == PostureClass.INSUFFICIENT_EVIDENCE
+
+        s3_partial = s3_engine.evaluate(t_partial, now_perf=10.0)
+        assert s3_partial.safety_tier == SafetyTier.SAFE
+        assert s3_partial.risk_score == 0
+
+        # Full body visible -> AI classifier predicts one of the 4 trained postures
+        full_xyc = np.column_stack(
+            (full_xyn[:, 0] * 640.0, full_xyn[:, 1] * 480.0, full_conf)
+        ).astype(np.float32)
+        t_full = posture_engine.evaluate_person(
+            track_id=1,
+            bbox=(240.0, 60.0, 380.0, 440.0),
+            det_conf=0.95,
+            keypoints_xyc=full_xyc,
+            timestamp=11.0,
+            frame_height=480,
+            frame_width=640,
+        )
+        assert t_full.whole_body_visible is True
+        assert t_full.posture in {
+            PostureClass.STANDING,
+            PostureClass.SITTING,
+            PostureClass.BENDING,
+            PostureClass.LYING_DOWN,
+        }
+        assert t_full.ai_confidence is not None and t_full.ai_confidence > 0.0
+    finally:
+        s3_engine.shutdown()
+
+
+
